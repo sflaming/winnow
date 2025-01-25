@@ -1,4 +1,9 @@
 #!/bin/zsh
+# v1.0 
+# Quickly identify and rename photos on an SD card 
+# that already exist on a specified drive,  
+# ensuring duplicates are clearly marked 
+# for easy organization and cleanup.
 
 # Function to prompt the user for input
 prompt_user() {
@@ -47,17 +52,18 @@ for sd_file in "$sd_card_path"/**/*(N); do
     printf "\rProcessing file %d of %d..." "$count" "$total_files"
     sd_basename_noext=${${sd_file:t}%%.*} # Get base name without extension
     matching_files=("$drive_path"/**/*"$sd_basename_noext"*.*(N)) # Match files with the same base name
-    for match in $matching_files; do
-        match_ext=${match##*.} # Extract extension of the match
-        sd_ext=${sd_file##*.} # Extract extension of the SD file
-        if [[ "$match_ext" == "$sd_ext" ]]; then
-            matches+=("$sd_file|$match")
-        fi
-    done
-    
-    # Clear progress indicator at the end
-    printf "\n"
+    if [[ ${#matching_files[@]} -gt 0 ]]; then
+        for match in $matching_files; do
+            match_ext=${match##*.} # Extract extension of the match
+            sd_ext=${sd_file##*.} # Extract extension of the SD file
+            if [[ "$match_ext" == "$sd_ext" ]]; then
+                matches+=("$sd_file|$match")
+            fi
+        done
+    fi
+
 done
+printf "\n"
 
 if [[ ${#matches[@]} -eq 0 ]]; then
     echo "No matching files found on the selected drive."

@@ -45,15 +45,19 @@ count=0
 for sd_file in "$sd_card_path"/**/*(N); do
     ((count++))
     printf "\rProcessing file %d of %d..." "$count" "$total_files"
-    sd_filename=$(basename "$sd_file")
-    matching_files=("$drive_path"/**/*"$sd_filename"*(N))
-    if [[ ${#matching_files[@]} -gt 0 ]]; then
-        for match in $matching_files; do
+    sd_basename_noext=${${sd_file:t}%%.*} # Get base name without extension
+    matching_files=("$drive_path"/**/*"$sd_basename_noext"*.*(N)) # Match files with the same base name
+    for match in $matching_files; do
+        match_ext=${match##*.} # Extract extension of the match
+        sd_ext=${sd_file##*.} # Extract extension of the SD file
+        if [[ "$match_ext" == "$sd_ext" ]]; then
             matches+=("$sd_file|$match")
-        done
-    fi
+        fi
+    done
+    
+    # Clear progress indicator at the end
+    printf "\n"
 done
-printf "\n"
 
 if [[ ${#matches[@]} -eq 0 ]]; then
     echo "No matching files found on the selected drive."

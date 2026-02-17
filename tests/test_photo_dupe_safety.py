@@ -70,7 +70,7 @@ class SafetyRulesTests(unittest.TestCase):
         )
         self.assertEqual(matches, [])
 
-    def test_blacklist_extension_is_ignored_in_matching(self) -> None:
+    def test_blacklist_extension_can_still_exact_match(self) -> None:
         sd = FileInfo(
             path=Path("/sd/IMG_0001.XMP"),
             stem="IMG_0001",
@@ -96,9 +96,10 @@ class SafetyRulesTests(unittest.TestCase):
             enable_substring_fallback=True,
             exif_tolerance_seconds=2,
         )
-        self.assertEqual(matches, [])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].kind, "EXACT")
 
-    def test_scan_skips_blacklisted_extensions(self) -> None:
+    def test_scan_includes_blacklisted_extensions_for_exact_parity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             png = root / "A.PNG"
@@ -108,7 +109,7 @@ class SafetyRulesTests(unittest.TestCase):
 
             infos = scan_chunk_build_info(([png, xmp],))
             exts = sorted(fi.ext for fi in infos)
-            self.assertEqual(exts, [".png"])
+            self.assertEqual(exts, [".png", ".xmp"])
 
     def test_suggest_best_keep_prefers_earliest_exif(self) -> None:
         sd = FileInfo(path=Path("/sd/a.jpg"), stem="a", ext=".jpg", size=1, mtime=0, exif_dt=100)

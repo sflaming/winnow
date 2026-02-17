@@ -29,6 +29,7 @@ import json
 import hashlib
 import time
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from collections import defaultdict, Counter
@@ -90,6 +91,8 @@ TX_LOG_NAME = ".photo_dupe_transactions.jsonl"
 CONFIRM_WINDOW_SECONDS = 8.0
 RECENT_PATHS_FILE = Path.home() / ".photo_dupe_recent_paths.json"
 MAX_RECENT_PATHS = 12
+PROCESS_POOL_BROKEN = False
+PROCESS_POOL_BROKEN_REASON = ""
 
 try:
     import exifread  # type: ignore
@@ -420,8 +423,6 @@ def scan_chunk_build_info(args: Tuple[List[Path]]) -> List[FileInfo]:
             st = p.stat()
             ext = p.suffix.lower()
             stem = p.stem
-            if ext in BLACKLIST_EXTENSIONS:
-                continue
 
             exif_dt = None
             camera_model = None
@@ -456,6 +457,7 @@ def scan_directory_parallel_infos(
     description: str,
     emit_progress=None,
 ) -> List[FileInfo]:
+    global PROCESS_POOL_BROKEN, PROCESS_POOL_BROKEN_REASON
     all_files = collect_all_files(directory)
     total = len(all_files)
     if emit_progress:
@@ -480,13 +482,24 @@ def scan_directory_parallel_infos(
                     emit_progress(f"Scanning {description}: {completed}/{len(chunks)} chunks")
         return out
 
+    # In TUI we scan from a thread worker; process pools from non-main threads are
+    # unreliable on some Python/macOS builds (fds_to_keep / semaphore issues).
+    if threading.current_thread() is not threading.main_thread():
+        return run_with_executor(ThreadPoolExecutor)
+
+    if PROCESS_POOL_BROKEN:
+        if emit_progress and PROCESS_POOL_BROKEN_REASON:
+            emit_progress(f"Process workers unavailable ({PROCESS_POOL_BROKEN_REASON}). Using thread workers.")
+        return run_with_executor(ThreadPoolExecutor)
+
     try:
         return run_with_executor(ProcessPoolExecutor)
     except Exception as e:
+        PROCESS_POOL_BROKEN = True
+        PROCESS_POOL_BROKEN_REASON = f"{type(e).__name__}: {e}"
         if emit_progress:
             emit_progress(
-                f"Process workers unavailable ({type(e).__name__}: {e}). "
-                "Falling back to thread workers."
+                f"Process workers unavailable ({PROCESS_POOL_BROKEN_REASON}). Using thread workers."
             )
         return run_with_executor(ThreadPoolExecutor)
 
@@ -649,12 +662,9 @@ def find_matches_hybrid(
         return partial_hits[0], "Exact stem+ext+size + partial hash collision"
 
     for sd in sd_infos:
-        if sd.ext in BLACKLIST_EXTENSIONS:
-            continue
-
         # 1) exact stem+ext
         exact_list = drive_by_stem_ext.get((sd.stem, sd.ext), [])
-        exact_same_size = [drv for drv in exact_list if drv.size == sd.size and drv.ext not in BLACKLIST_EXTENSIONS]
+        exact_same_size = [drv for drv in exact_list if drv.size == sd.size]
         drv_exact, exact_reason = choose_exact_candidate(sd, exact_same_size)
         has_primary_exact = drv_exact is not None
         if drv_exact:
@@ -1030,8 +1040,8 @@ class PhotoDupeTUI(App):
     CSS = """
     Screen { layout: vertical; }
 
-    #top { height: auto; padding: 1; }
-    #main { height: 1fr; }
+    #top { height: auto; max-height: 55%; overflow-y: auto; padding: 1; }
+    #main { height: 1fr; min-height: 12; }
 
     #left { width: 38%; height: 1fr; }
     #right { width: 62%; height: 1fr; }
@@ -1045,9 +1055,9 @@ class PhotoDupeTUI(App):
     #status { height: auto; padding: 1 0; }
     #summary { height: auto; padding: 0 0 1 0; }
 
-    #matches_table { height: 2fr; }
-    #compare_panel { height: 1fr; border: round $accent; padding: 1; }
-    SelectionList { height: 1fr; }
+    #matches_table { height: 2fr; min-height: 8; }
+    #compare_panel { height: 1fr; min-height: 6; border: round $accent; padding: 1; }
+    SelectionList { height: 1fr; min-height: 6; }
 
     .row { height: auto; }
     .row Input { width: 1fr; min-width: 16; }
@@ -1074,14 +1084,14 @@ class PhotoDupeTUI(App):
                     yield Input(placeholder="/Volumes/Photos or D:\\Photos", id="drive_input")
                     yield Button("Pick…", id="pick_drive_btn")
                     yield Button("Native…", id="native_drive_btn")
-                yield Select([], prompt="Recent drive paths", allow_blank=True, id="drive_recent_select")
+                yield Select([], prompt="Recent drive paths", allow_blank=True, compact=True, id="drive_recent_select")
 
                 yield Static("SD card path (source):")
                 with Horizontal(classes="row"):
                     yield Input(placeholder="/Volumes/SDCARD or E:\\DCIM", id="sd_input")
                     yield Button("Pick…", id="pick_sd_btn")
                     yield Button("Native…", id="native_sd_btn")
-                yield Select([], prompt="Recent SD paths", allow_blank=True, id="sd_recent_select")
+                yield Select([], prompt="Recent SD paths", allow_blank=True, compact=True, id="sd_recent_select")
 
                 yield Static("Rename prefix (non-destructive):")
                 yield Input(value="COPIED_", id="prefix_input")
@@ -1102,11 +1112,7 @@ class PhotoDupeTUI(App):
                 yield Button("Rename selected (legacy)", id="apply_btn")
                 yield Button("Clear", id="clear_btn")
 
-            yield Static(
-                "Recommended workflow: Scan -> review compare panel -> Quarantine selected. "
-                "Rename is legacy and harder to undo.",
-                id="workflow_hint",
-            )
+            yield Static("Workflow: Scan -> review -> Quarantine selected. Rename is legacy.", id="workflow_hint")
             yield Static("", id="status")
             yield Static("", id="summary")
 

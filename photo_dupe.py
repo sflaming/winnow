@@ -30,6 +30,8 @@ import hashlib
 import time
 import subprocess
 import threading
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from collections import defaultdict, Counter
@@ -91,6 +93,29 @@ TX_LOG_NAME = ".photo_dupe_transactions.jsonl"
 CONFIRM_WINDOW_SECONDS = 8.0
 RECENT_PATHS_FILE = Path.home() / ".photo_dupe_recent_paths.json"
 MAX_RECENT_PATHS = 12
+RAW_PREVIEW_EXTENSIONS = {
+    ".raf",
+    ".cr2",
+    ".cr3",
+    ".nef",
+    ".arw",
+    ".rw2",
+    ".orf",
+    ".dng",
+}
+IMAGE_PREVIEW_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+PREVIEW_CACHE_DIR = Path(tempfile.gettempdir()) / "photo_dupe_preview_cache"
+PREVIEW_CHARS_WIDTH = 48
+PREVIEW_CHARS_HEIGHT = 14
 PROCESS_POOL_BROKEN = False
 PROCESS_POOL_BROKEN_REASON = ""
 
@@ -1031,6 +1056,130 @@ def find_last_pending_tx(records: List[dict]) -> Tuple[Optional[str], List[dict]
 
 
 # -----------------------------
+# Preview helpers
+# -----------------------------
+
+def _preview_cache_path_for(raw_path: Path, cache_root: Path = PREVIEW_CACHE_DIR) -> Path:
+    try:
+        st = raw_path.stat()
+        signature = f"{raw_path.resolve()}|{int(st.st_mtime)}|{int(st.st_size)}"
+    except Exception:
+        signature = str(raw_path)
+    digest = hashlib.blake2b(signature.encode("utf-8"), digest_size=16).hexdigest()
+    return cache_root / f"{digest}.jpg"
+
+
+def _extract_preview_with_exiftool(raw_path: Path, out_jpg: Path) -> Tuple[bool, str]:
+    exe = shutil.which("exiftool")
+    if not exe:
+        return False, "exiftool unavailable"
+
+    for tag in ("-PreviewImage", "-JpgFromRaw"):
+        try:
+            proc = subprocess.run(
+                [exe, "-b", tag, str(raw_path)],
+                capture_output=True,
+                check=False,
+            )
+        except Exception as e:
+            return False, f"exiftool failed: {e}"
+
+        if proc.returncode == 0 and proc.stdout:
+            try:
+                out_jpg.parent.mkdir(parents=True, exist_ok=True)
+                out_jpg.write_bytes(proc.stdout)
+                return True, f"embedded preview ({tag})"
+            except Exception as e:
+                return False, f"cannot write preview: {e}"
+
+    return False, "no embedded JPEG preview found"
+
+
+def _extract_preview_with_rawpy(raw_path: Path, out_jpg: Path) -> Tuple[bool, str]:
+    try:
+        import rawpy  # type: ignore
+    except Exception:
+        return False, "rawpy unavailable"
+
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return False, "Pillow unavailable"
+
+    try:
+        with rawpy.imread(str(raw_path)) as raw:
+            rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+        out_jpg.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(rgb).save(out_jpg, format="JPEG", quality=90)
+        return True, "decoded with rawpy"
+    except Exception as e:
+        return False, f"raw decode failed: {e}"
+
+
+def resolve_preview_image(path: Path) -> Tuple[Optional[Path], str]:
+    ext = path.suffix.lower()
+    if not path.exists() or not path.is_file():
+        return None, "file not found"
+
+    if ext in IMAGE_PREVIEW_EXTENSIONS:
+        return path, "direct image preview"
+
+    if ext not in RAW_PREVIEW_EXTENSIONS:
+        return None, f"unsupported preview extension: {ext or '(none)'}"
+
+    cached = _preview_cache_path_for(path)
+    try:
+        if cached.exists() and cached.stat().st_size > 0:
+            return cached, "cached RAW preview"
+    except Exception:
+        pass
+
+    ok, msg = _extract_preview_with_exiftool(path, cached)
+    if ok:
+        return cached, msg
+
+    ok_rawpy, msg_rawpy = _extract_preview_with_rawpy(path, cached)
+    if ok_rawpy:
+        return cached, msg_rawpy
+
+    return None, f"{msg}; {msg_rawpy}. install exiftool or rawpy+Pillow for RAW previews"
+
+
+def render_preview_ascii(path: Path, width: int = PREVIEW_CHARS_WIDTH, height: int = PREVIEW_CHARS_HEIGHT) -> Tuple[Optional[str], str]:
+    preview_path, source_note = resolve_preview_image(path)
+    if preview_path is None:
+        return None, source_note
+
+    exe = shutil.which("chafa")
+    if not exe:
+        return None, f"{source_note}; chafa unavailable"
+
+    attempts = [
+        [exe, "--size", f"{width}x{height}", "--symbols", "ascii", "--colors", "0", str(preview_path)],
+        [exe, "--size", f"{width}x{height}", str(preview_path)],
+    ]
+    last_err = ""
+
+    for cmd in attempts:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.rstrip(), source_note
+        last_err = (proc.stderr or "").strip() or f"exit {proc.returncode}"
+
+    return None, f"{source_note}; chafa failed ({last_err})"
+
+
+# -----------------------------
 # Textual App
 # -----------------------------
 
@@ -1057,6 +1206,7 @@ class PhotoDupeTUI(App):
 
     #matches_table { height: 2fr; min-height: 8; }
     #compare_panel { height: 1fr; min-height: 6; border: round $accent; padding: 1; }
+    #preview_panel { height: 1fr; min-height: 8; border: round $accent; padding: 1; overflow-y: auto; }
     SelectionList { height: 1fr; min-height: 6; }
 
     .row { height: auto; }
@@ -1073,6 +1223,7 @@ class PhotoDupeTUI(App):
     pending_confirm_until: float = 0.0
     recent_paths: Dict[str, List[str]] = {"drive": [], "sd": []}
     recent_events_suspended: bool = False
+    preview_generation: int = 0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1126,6 +1277,8 @@ class PhotoDupeTUI(App):
                 yield DataTable(id="matches_table")
                 yield Static("Compare panel")
                 yield Static("Select a match to compare metadata.", id="compare_panel")
+                yield Static("Preview panel")
+                yield Static("Select a match to render previews.", id="preview_panel")
 
         yield Footer()
 
@@ -1198,6 +1351,56 @@ class PhotoDupeTUI(App):
 
     def _set_compare(self, msg: str) -> None:
         self.query_one("#compare_panel", Static).update(msg)
+
+    def _set_preview(self, msg: str) -> None:
+        self.query_one("#preview_panel", Static).update(msg)
+
+    def _format_preview_block(self, label: str, path: Path) -> str:
+        art, source = render_preview_ascii(path)
+        if art:
+            return "\n".join(
+                [
+                    f"{label}: {path.name}",
+                    art,
+                    f"Source: {source}",
+                ]
+            )
+        return "\n".join(
+            [
+                f"{label}: {path.name}",
+                f"Preview unavailable: {source}",
+            ]
+        )
+
+    def _format_preview_panel(self, row: MatchRow) -> str:
+        sd_block = self._format_preview_block("SD", row.sd.path)
+        drive_block = self._format_preview_block("Drive", row.drive.path)
+        return "\n\n".join([sd_block, drive_block])
+
+    def _update_preview_if_current(self, generation: int, text: str) -> None:
+        if generation != self.preview_generation:
+            return
+        self._set_preview(text)
+
+    def _preview_worker(self, row: MatchRow, generation: int) -> None:
+        rendered = self._format_preview_panel(row)
+        self.call_from_thread(self._update_preview_if_current, generation, rendered)
+
+    def _request_preview_render(self, row: Optional[MatchRow]) -> None:
+        self.preview_generation += 1
+        generation = self.preview_generation
+
+        if row is None:
+            self._set_preview("Select a match to render previews.")
+            return
+
+        self._set_preview("Rendering previews…")
+        self.run_worker(
+            lambda: self._preview_worker(row, generation),
+            exclusive=False,
+            name=f"preview_worker_{generation}",
+            thread=True,
+        )
 
     def _refresh_recent_select(self, key: str) -> None:
         select_id = "#drive_recent_select" if key == "drive" else "#sd_recent_select"
@@ -1358,7 +1561,9 @@ class PhotoDupeTUI(App):
             f"Unique SD files: {unique_sd} | Conversions enabled: "
             f"{len(self.enabled_cross_types)}/{len(self.cross_types)}"
         )
-        self._set_compare(self._format_compare_panel(filtered[0] if filtered else None))
+        first = filtered[0] if filtered else None
+        self._set_compare(self._format_compare_panel(first))
+        self._request_preview_render(first)
 
     # -----------------
     # Actions
@@ -1426,6 +1631,7 @@ class PhotoDupeTUI(App):
         self.query_one("#formats_list", SelectionList).clear_options()
         self.query_one("#matches_table", DataTable).clear()
         self._set_compare("Select a match to compare metadata.")
+        self._request_preview_render(None)
         self._set_status("Cleared. Pick folders and Scan.")
 
     def action_scan(self) -> None:
@@ -1520,6 +1726,7 @@ class PhotoDupeTUI(App):
             return
         row = self._match_from_row_key(event.row_key)
         self._set_compare(self._format_compare_panel(row))
+        self._request_preview_render(row)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if self.recent_events_suspended:

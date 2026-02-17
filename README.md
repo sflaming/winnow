@@ -118,11 +118,17 @@ SD Card/
 
 - ✅ **GUI Folder Selection**: User-friendly dialog boxes
 - ✅ **Recursive Search**: Searches all subdirectories
-- ✅ **Extension Matching**: Only matches files with same extension
+- ✅ **Extension Matching**: Matches files with same extension
+- ✅ **Cross-Format Detection**: NEW! Detects when same photo exists in different formats (e.g., RAW + JPG)
+- ✅ **Format Blacklist**: NEW! Auto-excludes irrelevant formats (.cop, .cos, .cot, etc.) - easily customizable
+- ✅ **Interactive Format Filter**: Select which format conversions to include (e.g., include .raf→.jpg, skip others)
+- ✅ **Grouped Results**: Separately displays exact matches vs. cross-format matches
+- ✅ **Selective Renaming**: Choose to rename exact matches, cross-format matches, or both
 - ✅ **Progress Indicators**: Real-time processing updates
 - ✅ **Safe Renaming**: Checks for existing files before renaming
 - ✅ **Error Handling**: Graceful handling of permission issues
 - ✅ **Batch Processing**: Handles thousands of files efficiently
+- ✅ **Verbose Mode**: Detailed debugging output with `--verbose` flag
 
 ## Requirements
 

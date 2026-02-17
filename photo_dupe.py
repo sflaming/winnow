@@ -25,10 +25,14 @@ import os
 import sys
 import argparse
 import re
+import json
+import hashlib
+import time
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from collections import defaultdict, Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
@@ -41,6 +45,7 @@ from textual.widgets import (
     Input,
     Button,
     DataTable,
+    Select,
     SelectionList,
     Switch,
     DirectoryTree,
@@ -77,6 +82,15 @@ EXIF_CANDIDATE_EXTS = {
     ".orf",
 }
 
+PARTIAL_HASH_BYTES = 1024 * 1024
+PARTIAL_HASH_CHUNK = 256 * 1024
+FULL_HASH_CHUNK = 1024 * 1024
+QUARANTINE_DIR_NAME = ".photo_dupe_quarantine"
+TX_LOG_NAME = ".photo_dupe_transactions.jsonl"
+CONFIRM_WINDOW_SECONDS = 8.0
+RECENT_PATHS_FILE = Path.home() / ".photo_dupe_recent_paths.json"
+MAX_RECENT_PATHS = 12
+
 try:
     import exifread  # type: ignore
 except Exception:
@@ -94,8 +108,11 @@ class FileInfo:
     ext: str
     size: int
     mtime: float
-    exif_dt: Optional[int]      # epoch seconds
-    camera_model: Optional[str]
+    exif_dt: Optional[int] = None       # epoch seconds
+    camera_model: Optional[str] = None
+    lens_model: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +262,71 @@ class FolderPicker(Screen):
             self.query_one("#hint", Static).update("That path does not exist or is not a folder.")
 
 
+class QuarantineViewer(Screen):
+    """Read-only view of files currently in quarantine."""
+
+    CSS = """
+    QuarantineViewer {
+        align: center middle;
+    }
+    #q_dialog {
+        width: 92%;
+        height: 88%;
+        border: heavy $primary;
+        background: $panel;
+        padding: 1;
+    }
+    #q_table { height: 1fr; border: round $accent; }
+    #q_actions { height: auto; }
+    """
+
+    def __init__(self, quarantine_root: Path) -> None:
+        super().__init__()
+        self.quarantine_root = quarantine_root
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="q_dialog"):
+            yield Static(f"Quarantine: {self.quarantine_root}")
+            yield DataTable(id="q_table")
+            with Horizontal(id="q_actions"):
+                yield Button("Refresh", id="q_refresh_btn")
+                yield Button("Close", id="q_close_btn", variant="primary")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#q_table", DataTable)
+        table.add_columns("File", "Relative Path", "Size", "Modified")
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        table = self.query_one("#q_table", DataTable)
+        table.clear()
+
+        if not self.quarantine_root.exists():
+            return
+
+        files = [p for p in self.quarantine_root.rglob("*") if p.is_file()]
+        files.sort(key=lambda p: str(p).lower())
+        for i, p in enumerate(files):
+            try:
+                rel = p.relative_to(self.quarantine_root)
+            except Exception:
+                rel = Path(p.name)
+            try:
+                st = p.stat()
+                size_txt = format_size(int(st.st_size))
+                mtime_txt = datetime.fromtimestamp(float(st.st_mtime)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                size_txt = "?"
+                mtime_txt = "?"
+            table.add_row(p.name, str(rel), size_txt, mtime_txt, key=str(i))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "q_close_btn":
+            self.app.pop_screen()
+        elif event.button.id == "q_refresh_btn":
+            self._refresh_table()
+
+
 # -----------------------------
 # EXIF helpers
 # -----------------------------
@@ -260,18 +342,31 @@ def _parse_exif_dt_string(s: str) -> Optional[int]:
     return None
 
 
-def read_exif_quick(path: Path) -> Tuple[Optional[int], Optional[str]]:
+def _parse_int_tag_value(tag_value: str) -> Optional[int]:
+    m = re.search(r"\d+", tag_value)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+
+def read_exif_quick(path: Path) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[int], Optional[int]]:
     if exifread is None:
-        return None, None
+        return None, None, None, None, None
 
     try:
         with path.open("rb") as f:
             tags = exifread.process_file(f, details=False, strict=True)
     except Exception:
-        return None, None
+        return None, None, None, None, None
 
     dt_val = None
     model_val = None
+    lens_val = None
+    width_val = None
+    height_val = None
 
     for key in ("EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"):
         tag = tags.get(key)
@@ -284,7 +379,19 @@ def read_exif_quick(path: Path) -> Tuple[Optional[int], Optional[str]]:
     if model_tag:
         model_val = str(model_tag).strip() or None
 
-    return dt_val, model_val
+    lens_tag = tags.get("EXIF LensModel") or tags.get("EXIF LensSpecification")
+    if lens_tag:
+        lens_val = str(lens_tag).strip() or None
+
+    width_tag = tags.get("EXIF ExifImageWidth") or tags.get("Image ImageWidth")
+    if width_tag:
+        width_val = _parse_int_tag_value(str(width_tag))
+
+    height_tag = tags.get("EXIF ExifImageLength") or tags.get("Image ImageLength")
+    if height_tag:
+        height_val = _parse_int_tag_value(str(height_tag))
+
+    return dt_val, model_val, lens_val, width_val, height_val
 
 
 # -----------------------------
@@ -318,8 +425,11 @@ def scan_chunk_build_info(args: Tuple[List[Path]]) -> List[FileInfo]:
 
             exif_dt = None
             camera_model = None
+            lens_model = None
+            width = None
+            height = None
             if ext in EXIF_CANDIDATE_EXTS:
-                exif_dt, camera_model = read_exif_quick(p)
+                exif_dt, camera_model, lens_model, width, height = read_exif_quick(p)
 
             out.append(
                 FileInfo(
@@ -330,6 +440,9 @@ def scan_chunk_build_info(args: Tuple[List[Path]]) -> List[FileInfo]:
                     mtime=float(st.st_mtime),
                     exif_dt=exif_dt,
                     camera_model=camera_model,
+                    lens_model=lens_model,
+                    width=width,
+                    height=height,
                 )
             )
         except Exception:
@@ -355,17 +468,74 @@ def scan_directory_parallel_infos(
     chunk_size = max(total // (num_processes * 4), 250)
     chunks = [all_files[i : i + chunk_size] for i in range(0, total, chunk_size)]
 
-    out: List[FileInfo] = []
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        futures = [executor.submit(scan_chunk_build_info, (chunk,)) for chunk in chunks]
-        completed = 0
-        for fut in as_completed(futures):
-            out.extend(fut.result())
-            completed += 1
-            if emit_progress:
-                emit_progress(f"Scanning {description}: {completed}/{len(chunks)} chunks")
+    def run_with_executor(executor_cls) -> List[FileInfo]:
+        out: List[FileInfo] = []
+        with executor_cls(max_workers=num_processes) as executor:
+            futures = [executor.submit(scan_chunk_build_info, (chunk,)) for chunk in chunks]
+            completed = 0
+            for fut in as_completed(futures):
+                out.extend(fut.result())
+                completed += 1
+                if emit_progress:
+                    emit_progress(f"Scanning {description}: {completed}/{len(chunks)} chunks")
+        return out
 
-    return out
+    try:
+        return run_with_executor(ProcessPoolExecutor)
+    except Exception as e:
+        if emit_progress:
+            emit_progress(
+                f"Process workers unavailable ({type(e).__name__}: {e}). "
+                "Falling back to thread workers."
+            )
+        return run_with_executor(ThreadPoolExecutor)
+
+
+# -----------------------------
+# Hash / Keep helpers
+# -----------------------------
+
+def partial_hash_file(path: Path) -> Optional[str]:
+    try:
+        size = path.stat().st_size
+        h = hashlib.blake2b(digest_size=16)
+        with path.open("rb") as f:
+            if size <= PARTIAL_HASH_BYTES * 2:
+                while True:
+                    chunk = f.read(PARTIAL_HASH_CHUNK)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            else:
+                h.update(f.read(PARTIAL_HASH_BYTES))
+                f.seek(max(size - PARTIAL_HASH_BYTES, 0))
+                h.update(f.read(PARTIAL_HASH_BYTES))
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def full_hash_file(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.blake2b(digest_size=32)
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(FULL_HASH_CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def suggest_best_keep(sd: FileInfo, drive: FileInfo) -> Tuple[str, str]:
+    # Prefer earliest capture time when both are known; otherwise prefer drive.
+    if sd.exif_dt is not None and drive.exif_dt is not None and sd.exif_dt != drive.exif_dt:
+        if sd.exif_dt < drive.exif_dt:
+            return "SD", "Earlier DateTimeOriginal"
+        return "DRIVE", "Earlier DateTimeOriginal"
+    return "DRIVE", "Already in destination structure"
 
 
 # -----------------------------
@@ -440,6 +610,43 @@ def find_matches_hybrid(
 
     matches: List[MatchRow] = []
     cross_types: set[str] = set()
+    partial_cache: Dict[Path, Optional[str]] = {}
+    full_cache: Dict[Path, Optional[str]] = {}
+
+    def get_partial(path: Path) -> Optional[str]:
+        if path not in partial_cache:
+            partial_cache[path] = partial_hash_file(path)
+        return partial_cache[path]
+
+    def get_full(path: Path) -> Optional[str]:
+        if path not in full_cache:
+            full_cache[path] = full_hash_file(path)
+        return full_cache[path]
+
+    def choose_exact_candidate(sd: FileInfo, candidates: List[FileInfo]) -> Tuple[Optional[FileInfo], str]:
+        if not candidates:
+            return None, ""
+        if len(candidates) == 1:
+            return candidates[0], "Exact stem+ext+size match"
+
+        sd_partial = get_partial(sd.path)
+        if sd_partial is None:
+            return candidates[0], "Exact stem+ext+size match (hash unavailable)"
+
+        partial_hits = [drv for drv in candidates if get_partial(drv.path) == sd_partial]
+        if len(partial_hits) == 1:
+            return partial_hits[0], "Exact stem+ext+size + partial hash match"
+        if not partial_hits:
+            return candidates[0], "Exact stem+ext+size match"
+
+        sd_full = get_full(sd.path)
+        if sd_full is None:
+            return partial_hits[0], "Exact stem+ext+size + partial hash collision"
+
+        full_hits = [drv for drv in partial_hits if get_full(drv.path) == sd_full]
+        if full_hits:
+            return full_hits[0], "Exact stem+ext+size + full hash match"
+        return partial_hits[0], "Exact stem+ext+size + partial hash collision"
 
     for sd in sd_infos:
         if sd.ext in BLACKLIST_EXTENSIONS:
@@ -448,15 +655,16 @@ def find_matches_hybrid(
         # 1) exact stem+ext
         exact_list = drive_by_stem_ext.get((sd.stem, sd.ext), [])
         exact_same_size = [drv for drv in exact_list if drv.size == sd.size and drv.ext not in BLACKLIST_EXTENSIONS]
-        if exact_same_size:
-            drv = exact_same_size[0]
+        drv_exact, exact_reason = choose_exact_candidate(sd, exact_same_size)
+        has_primary_exact = drv_exact is not None
+        if drv_exact:
             matches.append(
                 MatchRow(
                     kind="EXACT",
                     sd=sd,
-                    drive=drv,
+                    drive=drv_exact,
                     format_type="",
-                    reason="Exact stem+ext+size match",
+                    reason=exact_reason,
                 )
             )
 
@@ -465,7 +673,7 @@ def find_matches_hybrid(
 
         if exif_cands:
             best_same_ext = next((c for c in exif_cands if c[0].ext == sd.ext), None)
-            if best_same_ext and not exact_same_size:
+            if best_same_ext and not drv_exact:
                 drv, delta, score = best_same_ext
                 reason = f"EXIF time match (Δ{delta}s, score {score})"
                 if sd.size == drv.size:
@@ -481,6 +689,7 @@ def find_matches_hybrid(
                         reason=reason,
                     )
                 )
+                has_primary_exact = True
 
             # cross-format EXIF matches
             for drv, delta, score in exif_cands[:8]:
@@ -507,7 +716,7 @@ def find_matches_hybrid(
                 )
 
         # 3) substring fallback (legacy) only if no EXIF and no exact match
-        if enable_substring_fallback and (sd.exif_dt is None) and (not exact_list):
+        if enable_substring_fallback and (not has_primary_exact):
             sd_stem = sd.stem
             sd_ext = sd.ext
 
@@ -589,6 +798,228 @@ def validate_prefix(prefix: str) -> Optional[str]:
     return None
 
 
+def select_folder_native(prompt: str, initial: Optional[Path] = None) -> Optional[Path]:
+    """Open OS-native folder picker (supports SMB/network volumes on macOS Finder picker)."""
+    if sys.platform == "darwin":
+        safe_prompt = prompt.replace('"', '\\"')
+        lines = [f'set pickedFolder to choose folder with prompt "{safe_prompt}"']
+        if initial is not None and initial.exists():
+            safe_init = str(initial).replace('"', '\\"')
+            lines = [f'set pickedFolder to choose folder with prompt "{safe_prompt}" default location POSIX file "{safe_init}"']
+        lines.append("POSIX path of pickedFolder")
+        script = "\n".join(lines)
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        picked = proc.stdout.strip()
+        if not picked:
+            return None
+        p = Path(picked).expanduser()
+        return p if p.exists() and p.is_dir() else None
+
+    # Fallback: tkinter native dialog where available.
+    try:
+        from tkinter import Tk, filedialog  # type: ignore
+    except Exception:
+        return None
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    start_dir = str(initial) if initial and initial.exists() else None
+    picked = filedialog.askdirectory(title=prompt, initialdir=start_dir)
+    root.destroy()
+    if not picked:
+        return None
+    p = Path(picked).expanduser()
+    return p if p.exists() and p.is_dir() else None
+
+
+def load_recent_paths(store_path: Path = RECENT_PATHS_FILE) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {"drive": [], "sd": []}
+    if not store_path.exists():
+        return out
+    try:
+        raw = json.loads(store_path.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    if not isinstance(raw, dict):
+        return out
+
+    for key in ("drive", "sd"):
+        vals = raw.get(key, [])
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        if isinstance(vals, list):
+            for v in vals:
+                if not isinstance(v, str):
+                    continue
+                s = v.strip()
+                if not s or s in seen:
+                    continue
+                cleaned.append(s)
+                seen.add(s)
+        out[key] = cleaned[:MAX_RECENT_PATHS]
+    return out
+
+
+def save_recent_paths(recent: Dict[str, List[str]], store_path: Path = RECENT_PATHS_FILE) -> None:
+    payload = {
+        "drive": list(recent.get("drive", []))[:MAX_RECENT_PATHS],
+        "sd": list(recent.get("sd", []))[:MAX_RECENT_PATHS],
+    }
+    try:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def remember_recent_path(
+    recent: Dict[str, List[str]],
+    key: str,
+    path: Path,
+    *,
+    limit: int = MAX_RECENT_PATHS,
+) -> bool:
+    if key not in ("drive", "sd"):
+        return False
+    s = str(path.expanduser())
+    if not s:
+        return False
+    existing = [p for p in recent.get(key, []) if isinstance(p, str) and p]
+    new_list = [s] + [p for p in existing if p != s]
+    new_list = new_list[:limit]
+    changed = new_list != existing
+    recent[key] = new_list
+    return changed
+
+
+def format_exif_dt(ts: Optional[int]) -> str:
+    if ts is None:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+
+def format_dimensions(fi: FileInfo) -> str:
+    if fi.width and fi.height:
+        return f"{fi.width}x{fi.height}"
+    return "-"
+
+
+def format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024.0
+    return f"{int(num_bytes)}B"
+
+
+def quarantine_root_for(sd_root: Path) -> Path:
+    return sd_root / QUARANTINE_DIR_NAME
+
+
+def transaction_log_for(sd_root: Path) -> Path:
+    return sd_root / TX_LOG_NAME
+
+
+def _ensure_unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for i in range(1, 100000):
+        candidate = path.with_name(f"{stem}.{i}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Unable to allocate unique destination path.")
+
+
+def move_to_quarantine(sd_file: Path, sd_root: Path, quarantine_root: Path) -> Tuple[bool, str, Optional[Path]]:
+    try:
+        src_resolved = sd_file.resolve()
+        quarantine_resolved = quarantine_root.resolve()
+        if quarantine_resolved in src_resolved.parents:
+            return False, f"SKIP already quarantined: {sd_file.name}", None
+    except Exception:
+        pass
+
+    try:
+        rel = sd_file.resolve().relative_to(sd_root.resolve())
+    except Exception:
+        rel = Path("orphans") / sd_file.name
+
+    dst = _ensure_unique_path(quarantine_root / rel)
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        sd_file.rename(dst)
+        return True, f"MOVED: {sd_file.name} -> {dst}", dst
+    except Exception as e:
+        return False, f"ERROR: {sd_file.name}: {e}", None
+
+
+def append_jsonl_record(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def load_jsonl_records(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
+    out: List[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    out.append(parsed)
+            except Exception:
+                continue
+    return out
+
+
+def find_last_pending_tx(records: List[dict]) -> Tuple[Optional[str], List[dict]]:
+    moves_by_tx: Dict[str, List[dict]] = defaultdict(list)
+    tx_order: List[str] = []
+    undone: set[str] = set()
+
+    for rec in records:
+        tx_id = rec.get("tx_id")
+        rec_type = rec.get("type")
+        if not tx_id or not isinstance(tx_id, str):
+            continue
+        if rec_type == "move":
+            if tx_id not in moves_by_tx:
+                tx_order.append(tx_id)
+            moves_by_tx[tx_id].append(rec)
+        elif rec_type == "undo_complete":
+            undone.add(tx_id)
+
+    for tx_id in reversed(tx_order):
+        if tx_id in undone:
+            continue
+        moves = moves_by_tx.get(tx_id, [])
+        if moves:
+            return tx_id, moves
+
+    return None, []
+
+
 # -----------------------------
 # Textual App
 # -----------------------------
@@ -607,21 +1038,31 @@ class PhotoDupeTUI(App):
 
     #paths { height: auto; }
     #toggles { height: auto; margin-top: 1; }
-    #actions { height: auto; margin-top: 1; }
+    #actions_top { height: auto; margin-top: 1; }
+    #actions_bottom { height: auto; margin-top: 1; }
+    #paths Select { width: 1fr; margin-top: 1; }
+    #workflow_hint { height: auto; padding: 0 0 1 0; }
     #status { height: auto; padding: 1 0; }
     #summary { height: auto; padding: 0 0 1 0; }
 
-    DataTable { height: 1fr; }
+    #matches_table { height: 2fr; }
+    #compare_panel { height: 1fr; border: round $accent; padding: 1; }
     SelectionList { height: 1fr; }
 
     .row { height: auto; }
     .row Input { width: 1fr; min-width: 16; }
-    .row Button { width: 10; min-width: 10; margin-left: 1; }
+    .row Button { width: auto; min-width: 9; margin-left: 1; }
+    #actions_top Button, #actions_bottom Button { width: auto; min-width: 14; }
     """
 
     all_matches: List[MatchRow] = []
     cross_types: List[str] = []
     enabled_cross_types: set[str] = set()
+    last_sd_root: Optional[Path] = None
+    pending_confirm_action: Optional[str] = None
+    pending_confirm_until: float = 0.0
+    recent_paths: Dict[str, List[str]] = {"drive": [], "sd": []}
+    recent_events_suspended: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -632,26 +1073,40 @@ class PhotoDupeTUI(App):
                 with Horizontal(classes="row"):
                     yield Input(placeholder="/Volumes/Photos or D:\\Photos", id="drive_input")
                     yield Button("Pick…", id="pick_drive_btn")
+                    yield Button("Native…", id="native_drive_btn")
+                yield Select([], prompt="Recent drive paths", allow_blank=True, id="drive_recent_select")
 
                 yield Static("SD card path (source):")
                 with Horizontal(classes="row"):
                     yield Input(placeholder="/Volumes/SDCARD or E:\\DCIM", id="sd_input")
                     yield Button("Pick…", id="pick_sd_btn")
+                    yield Button("Native…", id="native_sd_btn")
+                yield Select([], prompt="Recent SD paths", allow_blank=True, id="sd_recent_select")
 
                 yield Static("Rename prefix (non-destructive):")
                 yield Input(value="COPIED_", id="prefix_input")
 
             with Horizontal(id="toggles"):
                 yield Static("Legacy substring fallback:")
-                yield Switch(value=False, id="substring_switch")
+                yield Switch(value=True, id="substring_switch")
                 yield Static("EXIF tolerance (seconds):")
                 yield Input(value="2", id="tol_input")
 
-            with Horizontal(id="actions"):
+            with Horizontal(id="actions_top"):
                 yield Button("Scan", id="scan_btn", variant="primary")
-                yield Button("Apply rename", id="apply_btn")
+                yield Button("Quarantine selected", id="quarantine_btn", variant="warning")
+                yield Button("Undo quarantine", id="undo_btn")
+                yield Button("View quarantine", id="view_quarantine_btn")
+
+            with Horizontal(id="actions_bottom"):
+                yield Button("Rename selected (legacy)", id="apply_btn")
                 yield Button("Clear", id="clear_btn")
 
+            yield Static(
+                "Recommended workflow: Scan -> review compare panel -> Quarantine selected. "
+                "Rename is legacy and harder to undo.",
+                id="workflow_hint",
+            )
             yield Static("", id="status")
             yield Static("", id="summary")
 
@@ -663,12 +1118,23 @@ class PhotoDupeTUI(App):
             with Vertical(id="right"):
                 yield Static("Matches (review) — includes Reason")
                 yield DataTable(id="matches_table")
+                yield Static("Compare panel")
+                yield Static("Select a match to compare metadata.", id="compare_panel")
 
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#matches_table", DataTable)
-        table.add_columns("Type", "SD File", "SD Ext", "Drive File", "Drive Ext", "Conversion", "Reason")
+        table.add_columns(
+            "Type",
+            "SD File",
+            "SD Ext",
+            "Drive File",
+            "Drive Ext",
+            "Conversion",
+            "Keep",
+            "Reason",
+        )
         table.cursor_type = "row"
 
         if exifread is None:
@@ -676,28 +1142,43 @@ class PhotoDupeTUI(App):
         else:
             self._set_summary("EXIF engine: exifread enabled (capture-time matching active).")
 
-        self._set_status("Use Pick… buttons to choose folders, then Scan.")
+        self.recent_paths = load_recent_paths()
+        self._refresh_recent_select("drive")
+        self._refresh_recent_select("sd")
+
+        self._set_status(
+            "Pick folders, Scan, and review matches. Destructive actions require a second press to confirm."
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
         if bid == "scan_btn":
             self.action_scan()
+        elif bid == "quarantine_btn":
+            self.action_quarantine()
+        elif bid == "undo_btn":
+            self.action_undo_last_apply()
+        elif bid == "view_quarantine_btn":
+            self.action_view_quarantine()
         elif bid == "apply_btn":
             self.action_apply_rename()
         elif bid == "clear_btn":
             self.action_clear()
         elif bid == "pick_drive_btn":
             self.action_pick_folder("drive_input")
+        elif bid == "native_drive_btn":
+            self.action_pick_folder_native("drive_input")
         elif bid == "pick_sd_btn":
             self.action_pick_folder("sd_input")
+        elif bid == "native_sd_btn":
+            self.action_pick_folder_native("sd_input")
 
     # -----------------
     # Messages
     # -----------------
 
     def on_folder_picked(self, message: FolderPicked) -> None:
-        inp = self.query_one(f"#{message.field_id}", Input)
-        inp.value = str(message.path)
+        self._set_input_path(message.field_id, message.path)
 
     # -----------------
     # Helpers
@@ -708,6 +1189,99 @@ class PhotoDupeTUI(App):
 
     def _set_summary(self, msg: str) -> None:
         self.query_one("#summary", Static).update(msg)
+
+    def _set_compare(self, msg: str) -> None:
+        self.query_one("#compare_panel", Static).update(msg)
+
+    def _refresh_recent_select(self, key: str) -> None:
+        select_id = "#drive_recent_select" if key == "drive" else "#sd_recent_select"
+        select = self.query_one(select_id, Select)
+        options = [(p, p) for p in self.recent_paths.get(key, [])]
+        self.recent_events_suspended = True
+        try:
+            select.set_options(options)
+            select.value = Select.NULL
+        finally:
+            self.recent_events_suspended = False
+
+    def _remember_recent(self, key: str, path: Path) -> None:
+        if not path.exists() or not path.is_dir():
+            return
+        if not remember_recent_path(self.recent_paths, key, path):
+            return
+        save_recent_paths(self.recent_paths)
+        self._refresh_recent_select(key)
+
+    def _clear_pending_confirmation(self) -> None:
+        self.pending_confirm_action = None
+        self.pending_confirm_until = 0.0
+
+    def _confirm_or_arm(self, action_key: str, action_label: str, count: int) -> bool:
+        now = time.monotonic()
+        if self.pending_confirm_action == action_key and now <= self.pending_confirm_until:
+            self._clear_pending_confirmation()
+            return True
+
+        self.pending_confirm_action = action_key
+        self.pending_confirm_until = now + CONFIRM_WINDOW_SECONDS
+        self._set_status(
+            f"Confirm {action_label}: press the same button again within "
+            f"{int(CONFIRM_WINDOW_SECONDS)}s ({count} files)."
+        )
+        return False
+
+    def _get_sd_root_from_input(self) -> Optional[Path]:
+        raw = self.query_one("#sd_input", Input).value.strip()
+        if not raw:
+            return None
+        p = Path(raw).expanduser()
+        if p.exists() and p.is_dir():
+            return p
+        return None
+
+    def _unique_sd_files(self, rows: List[MatchRow]) -> List[Path]:
+        out: List[Path] = []
+        seen: set[Path] = set()
+        for m in rows:
+            if m.sd.path not in seen:
+                seen.add(m.sd.path)
+                out.append(m.sd.path)
+        return out
+
+    def _format_compare_panel(self, row: Optional[MatchRow]) -> str:
+        if row is None:
+            return "Select a match to compare metadata."
+
+        keep_side, keep_reason = suggest_best_keep(row.sd, row.drive)
+        lines = [
+            f"Best keep: {keep_side} ({keep_reason})",
+            f"Match reason: {row.reason}",
+            "",
+            f"{'Field':<14} {'SD':<34} {'Drive'}",
+            f"{'Name':<14} {row.sd.path.name:<34.34} {row.drive.path.name}",
+            f"{'Size':<14} {format_size(row.sd.size):<34} {format_size(row.drive.size)}",
+            f"{'Capture':<14} {format_exif_dt(row.sd.exif_dt):<34} {format_exif_dt(row.drive.exif_dt)}",
+            f"{'Dimensions':<14} {format_dimensions(row.sd):<34} {format_dimensions(row.drive)}",
+            f"{'Camera':<14} {(row.sd.camera_model or '-'): <34.34} {row.drive.camera_model or '-'}",
+            f"{'Lens':<14} {(row.sd.lens_model or '-'): <34.34} {row.drive.lens_model or '-'}",
+            "",
+            f"SD path: {row.sd.path}",
+            f"Drive path: {row.drive.path}",
+        ]
+        return "\n".join(lines)
+
+    def _match_from_row_key(self, row_key) -> Optional[MatchRow]:
+        key_val = getattr(row_key, "value", None)
+        if key_val is None:
+            return None
+        try:
+            idx = int(str(key_val))
+        except Exception:
+            return None
+        filtered = self._current_filtered_matches()
+        if idx < 0 or idx >= len(filtered):
+            return None
+        return filtered[idx]
 
     def _read_inputs(self) -> Tuple[Optional[Path], Optional[Path], str, int, bool]:
         drive = self.query_one("#drive_input", Input).value.strip()
@@ -756,6 +1330,7 @@ class PhotoDupeTUI(App):
 
         filtered = self._current_filtered_matches()
         for i, m in enumerate(filtered):
+            keep_side, keep_reason = suggest_best_keep(m.sd, m.drive)
             table.add_row(
                 m.kind,
                 m.sd.path.name,
@@ -763,6 +1338,7 @@ class PhotoDupeTUI(App):
                 m.drive.path.name,
                 m.drive.ext,
                 m.format_type,
+                f"{keep_side} ({keep_reason})",
                 m.reason,
                 key=str(i),
             )
@@ -770,16 +1346,20 @@ class PhotoDupeTUI(App):
         counts = Counter(m.kind for m in filtered)
         exact_n = counts.get("EXACT", 0)
         cross_n = counts.get("CROSS", 0)
+        unique_sd = len(self._unique_sd_files(filtered))
         self._set_status(
             f"Showing {len(filtered)} matches — Exact: {exact_n} | Cross: {cross_n} | "
-            f"Conversions enabled: {len(self.enabled_cross_types)}/{len(self.cross_types)}"
+            f"Unique SD files: {unique_sd} | Conversions enabled: "
+            f"{len(self.enabled_cross_types)}/{len(self.cross_types)}"
         )
+        self._set_compare(self._format_compare_panel(filtered[0] if filtered else None))
 
     # -----------------
     # Actions
     # -----------------
 
     def action_pick_folder(self, field_id: str) -> None:
+        self._clear_pending_confirmation()
         # Start picker at current value if valid, else home/root
         raw = self.query_one(f"#{field_id}", Input).value.strip()
         start = None
@@ -798,15 +1378,52 @@ class PhotoDupeTUI(App):
 
         self.push_screen(FolderPicker(field_id=field_id, start_path=start))
 
+    def _set_input_path(self, field_id: str, path: Path) -> None:
+        self.query_one(f"#{field_id}", Input).value = str(path)
+        key = "drive" if field_id == "drive_input" else "sd"
+        self._remember_recent(key, path)
+
+    def action_pick_folder_native(self, field_id: str) -> None:
+        self._clear_pending_confirmation()
+        raw = self.query_one(f"#{field_id}", Input).value.strip()
+        start = None
+        if raw:
+            p = Path(raw).expanduser()
+            if p.exists() and p.is_dir():
+                start = p
+            elif p.parent.exists() and p.parent.is_dir():
+                start = p.parent
+
+        label = "Drive" if field_id == "drive_input" else "SD card"
+        self._set_status(f"Opening native folder picker for {label}…")
+        self.run_worker(
+            lambda: self._pick_folder_native_worker(field_id, label, start),
+            exclusive=False,
+            name=f"native_pick_{field_id}",
+            thread=True,
+        )
+
+    def _pick_folder_native_worker(self, field_id: str, label: str, start: Optional[Path]) -> None:
+        picked = select_folder_native(f"Select {label} folder", initial=start)
+        if picked is None:
+            self.call_from_thread(self._set_status, f"Native picker canceled or unavailable for {label}.")
+            return
+        self.call_from_thread(self._set_input_path, field_id, picked)
+        self.call_from_thread(self._set_status, f"Selected {label}: {picked}")
+
     def action_clear(self) -> None:
+        self._clear_pending_confirmation()
         self.all_matches = []
         self.cross_types = []
         self.enabled_cross_types = set()
+        self.last_sd_root = None
         self.query_one("#formats_list", SelectionList).clear_options()
         self.query_one("#matches_table", DataTable).clear()
+        self._set_compare("Select a match to compare metadata.")
         self._set_status("Cleared. Pick folders and Scan.")
 
     def action_scan(self) -> None:
+        self._clear_pending_confirmation()
         drive_path, sd_path, _, tol, substring = self._read_inputs()
         if drive_path is None or sd_path is None:
             self._set_status("Both Drive path and SD path are required.")
@@ -821,6 +1438,9 @@ class PhotoDupeTUI(App):
             self._set_status("Drive path and SD path must be different and not nested.")
             return
 
+        self._remember_recent("drive", drive_path)
+        self._remember_recent("sd", sd_path)
+        self.last_sd_root = sd_path
         self._set_status("Starting scan…")
         self.run_worker(
             lambda: self._scan_worker(drive_path, sd_path, tol, substring),
@@ -886,12 +1506,197 @@ class PhotoDupeTUI(App):
 
     def on_selection_list_selected_changed(self, event: SelectionList.SelectedChanged) -> None:
         sl = self.query_one("#formats_list", SelectionList)
-        enabled = set()
-        for opt in sl.options:
-            if opt.selected:
-                enabled.add(str(opt.value))
-        self.enabled_cross_types = enabled
+        self.enabled_cross_types = {str(value) for value in sl.selected}
         self._refresh_matches_table()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "matches_table":
+            return
+        row = self._match_from_row_key(event.row_key)
+        self._set_compare(self._format_compare_panel(row))
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if self.recent_events_suspended:
+            return
+        sid = event.select.id
+        if sid not in {"drive_recent_select", "sd_recent_select"}:
+            return
+        value = event.value
+        if not isinstance(value, str) or not value:
+            return
+
+        p = Path(value).expanduser()
+        if not p.exists() or not p.is_dir():
+            self._set_status(f"Recent path is unavailable: {p}")
+            return
+
+        field_id = "drive_input" if sid == "drive_recent_select" else "sd_input"
+        self._set_input_path(field_id, p)
+        label = "Drive" if field_id == "drive_input" else "SD card"
+        self._set_status(f"Loaded recent {label} path: {p}")
+
+    def action_view_quarantine(self) -> None:
+        self._clear_pending_confirmation()
+        sd_root = self._get_sd_root_from_input() or self.last_sd_root
+        if sd_root is None:
+            self._set_status("Set a valid SD path to view quarantine.")
+            return
+        self.push_screen(QuarantineViewer(quarantine_root_for(sd_root)))
+
+    def action_quarantine(self) -> None:
+        if not self.all_matches:
+            self._set_status("No matches loaded. Scan first.")
+            return
+        filtered = self._current_filtered_matches()
+        if not filtered:
+            self._set_status("No matches after filters.")
+            return
+
+        sd_root = self._get_sd_root_from_input() or self.last_sd_root
+        if sd_root is None or not sd_root.exists():
+            self._set_status("Set a valid SD path before quarantining.")
+            return
+
+        total = len(self._unique_sd_files(filtered))
+        if total == 0:
+            self._set_status("No files to quarantine.")
+            return
+        if not self._confirm_or_arm("quarantine", "quarantine", total):
+            return
+
+        self._set_status("Moving selected SD matches to quarantine…")
+        self.run_worker(
+            lambda: self._quarantine_worker(filtered, sd_root),
+            exclusive=True,
+            name="quarantine_worker",
+            thread=True,
+        )
+
+    def _quarantine_worker(self, filtered: List[MatchRow], sd_root: Path) -> None:
+        worker = get_current_worker()
+        sd_unique = self._unique_sd_files(filtered)
+        total = len(sd_unique)
+        if total == 0:
+            self.call_from_thread(self._set_status, "No files to quarantine.")
+            return
+
+        quarantine_root = quarantine_root_for(sd_root)
+        tx_log = transaction_log_for(sd_root)
+        tx_id = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S.%fZ')}-{os.getpid()}"
+
+        moved = 0
+        skipped = 0
+        errors = 0
+
+        for i, sd_file in enumerate(sd_unique, 1):
+            if worker.is_cancelled:
+                return
+            success, msg, dst = move_to_quarantine(sd_file, sd_root, quarantine_root)
+            if success and dst is not None:
+                moved += 1
+                append_jsonl_record(
+                    tx_log,
+                    {
+                        "type": "move",
+                        "tx_id": tx_id,
+                        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        "src": str(sd_file),
+                        "dst": str(dst),
+                    },
+                )
+            else:
+                if msg.startswith("SKIP"):
+                    skipped += 1
+                else:
+                    errors += 1
+            self.call_from_thread(self._set_status, f"{msg} ({i}/{total})")
+
+        self.call_from_thread(
+            self._set_status,
+            f"Quarantine complete. Moved {moved}/{total}. Skipped {skipped}. Errors {errors}. "
+            f"Transaction: {tx_id}",
+        )
+
+    def action_undo_last_apply(self) -> None:
+        sd_root = self._get_sd_root_from_input() or self.last_sd_root
+        if sd_root is None or not sd_root.exists():
+            self._set_status("Set a valid SD path before undo.")
+            return
+
+        tx_log = transaction_log_for(sd_root)
+        records = load_jsonl_records(tx_log)
+        tx_id, moves = find_last_pending_tx(records)
+        if tx_id is None or not moves:
+            self._set_status("No pending quarantine transaction to undo.")
+            return
+
+        if not self._confirm_or_arm(f"undo:{tx_id}", "undo last quarantine", len(moves)):
+            return
+
+        self._set_status(f"Undoing quarantine transaction {tx_id} ({len(moves)} files)…")
+        self.run_worker(
+            lambda: self._undo_last_apply_worker(tx_log, tx_id, moves),
+            exclusive=True,
+            name="undo_worker",
+            thread=True,
+        )
+
+    def _undo_last_apply_worker(self, tx_log: Path, tx_id: str, moves: List[dict]) -> None:
+        worker = get_current_worker()
+
+        restored = 0
+        skipped = 0
+        errors = 0
+
+        for i, rec in enumerate(reversed(moves), 1):
+            if worker.is_cancelled:
+                return
+            src = Path(str(rec.get("src", "")))
+            dst = Path(str(rec.get("dst", "")))
+            if not dst.exists():
+                skipped += 1
+                self.call_from_thread(
+                    self._set_status,
+                    f"SKIP missing quarantine file: {dst} ({i}/{len(moves)})",
+                )
+                continue
+            if src.exists():
+                skipped += 1
+                self.call_from_thread(
+                    self._set_status,
+                    f"SKIP target exists: {src} ({i}/{len(moves)})",
+                )
+                continue
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                dst.rename(src)
+                restored += 1
+                self.call_from_thread(
+                    self._set_status,
+                    f"RESTORED: {src.name} ({i}/{len(moves)})",
+                )
+            except Exception as e:
+                errors += 1
+                self.call_from_thread(
+                    self._set_status,
+                    f"ERROR restoring {src.name}: {e} ({i}/{len(moves)})",
+                )
+
+        append_jsonl_record(
+            tx_log,
+            {
+                "type": "undo_complete",
+                "tx_id": tx_id,
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "restored": restored,
+                "skipped": skipped,
+                "errors": errors,
+            },
+        )
+        self.call_from_thread(
+            self._set_status,
+            f"Undo complete for {tx_id}. Restored {restored}. Skipped {skipped}. Errors {errors}.",
+        )
 
     def action_apply_rename(self) -> None:
         if not self.all_matches:
@@ -908,6 +1713,10 @@ class PhotoDupeTUI(App):
             self._set_status("No matches after filters.")
             return
 
+        total = len(self._unique_sd_files(filtered))
+        if not self._confirm_or_arm("rename", "legacy rename", total):
+            return
+
         self._set_status(f"Applying rename prefix '{prefix}'…")
         self.run_worker(
             lambda: self._apply_worker(filtered, prefix),
@@ -920,12 +1729,7 @@ class PhotoDupeTUI(App):
         worker = get_current_worker()
 
         # Rename each SD file once
-        sd_unique: List[Path] = []
-        seen = set()
-        for m in filtered:
-            if m.sd.path not in seen:
-                seen.add(m.sd.path)
-                sd_unique.append(m.sd.path)
+        sd_unique = self._unique_sd_files(filtered)
 
         total = len(sd_unique)
         ok = 0

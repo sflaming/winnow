@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import sys
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from collections import defaultdict, Counter
@@ -312,6 +313,8 @@ def scan_chunk_build_info(args: Tuple[List[Path]]) -> List[FileInfo]:
             st = p.stat()
             ext = p.suffix.lower()
             stem = p.stem
+            if ext in BLACKLIST_EXTENSIONS:
+                continue
 
             exif_dt = None
             camera_model = None
@@ -439,17 +442,21 @@ def find_matches_hybrid(
     cross_types: set[str] = set()
 
     for sd in sd_infos:
+        if sd.ext in BLACKLIST_EXTENSIONS:
+            continue
+
         # 1) exact stem+ext
         exact_list = drive_by_stem_ext.get((sd.stem, sd.ext), [])
-        if exact_list:
-            drv = exact_list[0]
+        exact_same_size = [drv for drv in exact_list if drv.size == sd.size and drv.ext not in BLACKLIST_EXTENSIONS]
+        if exact_same_size:
+            drv = exact_same_size[0]
             matches.append(
                 MatchRow(
                     kind="EXACT",
                     sd=sd,
                     drive=drv,
                     format_type="",
-                    reason="Exact stem+ext match",
+                    reason="Exact stem+ext+size match",
                 )
             )
 
@@ -458,7 +465,7 @@ def find_matches_hybrid(
 
         if exif_cands:
             best_same_ext = next((c for c in exif_cands if c[0].ext == sd.ext), None)
-            if best_same_ext and not exact_list:
+            if best_same_ext and not exact_same_size:
                 drv, delta, score = best_same_ext
                 reason = f"EXIF time match (Δ{delta}s, score {score})"
                 if sd.size == drv.size:
@@ -554,6 +561,32 @@ def rename_file_with_prefix(sd_file: Path, prefix: str) -> Tuple[bool, str]:
         return True, f"RENAMED: {sd_file.name} -> {new_name.name}"
     except Exception as e:
         return False, f"ERROR: {sd_file.name}: {e}"
+
+
+def paths_overlap(a: Path, b: Path) -> bool:
+    """True when paths are the same folder or nested."""
+    try:
+        pa = a.resolve()
+        pb = b.resolve()
+    except Exception:
+        return False
+    return pa == pb or pa in pb.parents or pb in pa.parents
+
+
+def validate_prefix(prefix: str) -> Optional[str]:
+    if not prefix:
+        return "Prefix is required."
+    if prefix in {".", ".."}:
+        return "Prefix cannot be '.' or '..'."
+    if "/" in prefix or "\\" in prefix:
+        return "Prefix cannot contain path separators."
+    if prefix.strip() != prefix:
+        return "Prefix cannot start or end with spaces."
+    if len(prefix) > 64:
+        return "Prefix is too long (max 64 chars)."
+    if not re.fullmatch(r"[A-Za-z0-9._ -]+", prefix):
+        return "Prefix contains unsupported characters."
+    return None
 
 
 # -----------------------------
@@ -784,6 +817,9 @@ class PhotoDupeTUI(App):
         if not sd_path.exists():
             self._set_status("SD path does not exist.")
             return
+        if paths_overlap(drive_path, sd_path):
+            self._set_status("Drive path and SD path must be different and not nested.")
+            return
 
         self._set_status("Starting scan…")
         self.run_worker(
@@ -863,6 +899,10 @@ class PhotoDupeTUI(App):
             return
 
         prefix = self.query_one("#prefix_input", Input).value.strip() or "COPIED_"
+        prefix_err = validate_prefix(prefix)
+        if prefix_err:
+            self._set_status(prefix_err)
+            return
         filtered = self._current_filtered_matches()
         if not filtered:
             self._set_status("No matches after filters.")

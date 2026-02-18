@@ -6,10 +6,7 @@ Adds a modal folder picker so users don't need to type deep paths.
 
 Match order:
   1) Exact stem+ext match
-  2) EXIF capture-time match (DateTimeOriginal/DateTimeDigitized) within tolerance
-     - camera model boost
-     - same ext + same size big boost
-  3) Optional legacy substring fallback (toggle)
+  2) Optional legacy substring fallback (toggle)
 
 UI:
   - Drive path input + Pick button
@@ -34,7 +31,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
@@ -116,6 +113,10 @@ IMAGE_PREVIEW_EXTENSIONS = {
 PREVIEW_CACHE_DIR = Path(tempfile.gettempdir()) / "photo_dupe_preview_cache"
 PREVIEW_CHARS_WIDTH = 48
 PREVIEW_CHARS_HEIGHT = 14
+PREVIEW_BLOCK_CACHE_LIMIT = 128
+PREVIEW_CMD_TIMEOUT_SECONDS = 4.0
+PREVIEW_DEBOUNCE_SECONDS = 0.18
+PHOTO_CLUSTER_GAP_SECONDS = 2
 PROCESS_POOL_BROKEN = False
 PROCESS_POOL_BROKEN_REASON = ""
 
@@ -639,7 +640,9 @@ def find_matches_hybrid(
     enable_substring_fallback: bool,
     exif_tolerance_seconds: int,
 ) -> Tuple[List[MatchRow], List[str]]:
-    drive_by_stem_ext, drive_by_exif_dt = build_drive_indexes(drive_infos)
+    # EXIF-time correlation is intentionally disabled due to burst-shot false positives.
+    _ = exif_tolerance_seconds
+    drive_by_stem_ext, _ = build_drive_indexes(drive_infos)
 
     drive_by_ext_for_sub: Dict[str, List[Tuple[str, FileInfo]]] = defaultdict(list)
     if enable_substring_fallback:
@@ -703,54 +706,7 @@ def find_matches_hybrid(
                 )
             )
 
-        # 2) EXIF correlation
-        exif_cands = exif_candidates_within_tolerance(sd, drive_by_exif_dt, exif_tolerance_seconds)
-
-        if exif_cands:
-            best_same_ext = next((c for c in exif_cands if c[0].ext == sd.ext), None)
-            if best_same_ext and not drv_exact:
-                drv, delta, score = best_same_ext
-                reason = f"EXIF time match (Δ{delta}s, score {score})"
-                if sd.size == drv.size:
-                    reason += " + same size"
-                if sd.camera_model and drv.camera_model and sd.camera_model == drv.camera_model:
-                    reason += " + same camera"
-                matches.append(
-                    MatchRow(
-                        kind="EXACT",
-                        sd=sd,
-                        drive=drv,
-                        format_type="",
-                        reason=reason,
-                    )
-                )
-                has_primary_exact = True
-
-            # cross-format EXIF matches
-            for drv, delta, score in exif_cands[:8]:
-                if drv.ext == sd.ext:
-                    continue
-                if sd.ext in BLACKLIST_EXTENSIONS or drv.ext in BLACKLIST_EXTENSIONS:
-                    continue
-
-                fmt = f"{sd.ext} -> {drv.ext}"
-                cross_types.add(fmt)
-
-                reason = f"EXIF time match (Δ{delta}s, score {score})"
-                if sd.camera_model and drv.camera_model and sd.camera_model == drv.camera_model:
-                    reason += " + same camera"
-
-                matches.append(
-                    MatchRow(
-                        kind="CROSS",
-                        sd=sd,
-                        drive=drv,
-                        format_type=fmt,
-                        reason=reason,
-                    )
-                )
-
-        # 3) substring fallback (legacy) only if no EXIF and no exact match
+        # 2) substring fallback (legacy) only if no exact match
         if enable_substring_fallback and (not has_primary_exact):
             sd_stem = sd.stem
             sd_ext = sd.ext
@@ -1080,7 +1036,10 @@ def _extract_preview_with_exiftool(raw_path: Path, out_jpg: Path) -> Tuple[bool,
                 [exe, "-b", tag, str(raw_path)],
                 capture_output=True,
                 check=False,
+                timeout=PREVIEW_CMD_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired:
+            return False, "exiftool timed out"
         except Exception as e:
             return False, f"exiftool failed: {e}"
 
@@ -1167,7 +1126,11 @@ def render_preview_ascii(path: Path, width: int = PREVIEW_CHARS_WIDTH, height: i
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=PREVIEW_CMD_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired:
+            last_err = "timeout"
+            continue
         except Exception as e:
             last_err = str(e)
             continue
@@ -1192,8 +1155,9 @@ class PhotoDupeTUI(App):
     #top { height: auto; max-height: 55%; overflow-y: auto; padding: 1; }
     #main { height: 1fr; min-height: 12; }
 
-    #left { width: 38%; height: 1fr; }
-    #right { width: 62%; height: 1fr; }
+    #left { width: 26%; height: 1fr; }
+    #middle { width: 44%; height: 1fr; }
+    #preview_col { width: 30%; height: 1fr; }
 
     #paths { height: auto; }
     #toggles { height: auto; margin-top: 1; }
@@ -1203,11 +1167,16 @@ class PhotoDupeTUI(App):
     #workflow_hint { height: auto; padding: 0 0 1 0; }
     #status { height: auto; padding: 1 0; }
     #summary { height: auto; padding: 0 0 1 0; }
+    #selection_hint { height: auto; padding: 0 0 1 0; }
 
     #matches_table { height: 2fr; min-height: 8; }
     #compare_panel { height: 1fr; min-height: 6; border: round $accent; padding: 1; }
-    #preview_panel { height: 1fr; min-height: 8; border: round $accent; padding: 1; overflow-y: auto; }
+    #preview_panel { height: 1fr; min-height: 12; border: round $accent; padding: 1; overflow-y: auto; }
     SelectionList { height: 1fr; min-height: 6; }
+    #match_select_actions { height: auto; margin-top: 1; }
+    #match_select_actions Button { min-width: 11; }
+    #preview_action_row { height: auto; margin-top: 1; }
+    #preview_action_row Button { min-width: 14; }
 
     .row { height: auto; }
     .row Input { width: 1fr; min-width: 16; }
@@ -1224,6 +1193,13 @@ class PhotoDupeTUI(App):
     recent_paths: Dict[str, List[str]] = {"drive": [], "sd": []}
     recent_events_suspended: bool = False
     preview_generation: int = 0
+    preview_block_cache: OrderedDict[Tuple[str, int, int], str] = OrderedDict()
+    preview_inflight: bool = False
+    preview_pending: Optional[Tuple[MatchRow, int]] = None
+    preview_timer = None
+    preview_focus_row: Optional[MatchRow] = None
+    selected_match_keys: set[str] = set()
+    cluster_by_match_key: Dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1250,8 +1226,7 @@ class PhotoDupeTUI(App):
             with Horizontal(id="toggles"):
                 yield Static("Legacy substring fallback:")
                 yield Switch(value=True, id="substring_switch")
-                yield Static("EXIF tolerance (seconds):")
-                yield Input(value="2", id="tol_input")
+                yield Static("Exact + legacy substring matching")
 
             with Horizontal(id="actions_top"):
                 yield Button("Scan", id="scan_btn", variant="primary")
@@ -1263,7 +1238,7 @@ class PhotoDupeTUI(App):
                 yield Button("Rename selected (legacy)", id="apply_btn")
                 yield Button("Clear", id="clear_btn")
 
-            yield Static("Workflow: Scan -> review -> Quarantine selected. Rename is legacy.", id="workflow_hint")
+            yield Static("Workflow: Scan -> review -> Render preview as needed -> Quarantine selected.", id="workflow_hint")
             yield Static("", id="status")
             yield Static("", id="summary")
 
@@ -1271,12 +1246,23 @@ class PhotoDupeTUI(App):
             with Vertical(id="left"):
                 yield Static("Cross-format filters (toggle conversions)")
                 yield SelectionList(id="formats_list")
+                with Horizontal(id="match_select_actions"):
+                    yield Button("Select all", id="select_all_btn")
+                    yield Button("Select none", id="select_none_btn")
+                    yield Button("Toggle row", id="toggle_row_btn")
+                with Horizontal(id="preview_action_row"):
+                    yield Button("Render preview", id="render_preview_btn")
+                    yield Static("Auto preview:")
+                    yield Switch(value=False, id="auto_preview_switch")
 
-            with Vertical(id="right"):
+            with Vertical(id="middle"):
                 yield Static("Matches (review) — includes Reason")
+                yield Static("Selection: use Select all/none, Toggle row, or Enter on a row.", id="selection_hint")
                 yield DataTable(id="matches_table")
                 yield Static("Compare panel")
                 yield Static("Select a match to compare metadata.", id="compare_panel")
+
+            with Vertical(id="preview_col"):
                 yield Static("Preview panel")
                 yield Static("Select a match to render previews.", id="preview_panel")
 
@@ -1285,7 +1271,9 @@ class PhotoDupeTUI(App):
     def on_mount(self) -> None:
         table = self.query_one("#matches_table", DataTable)
         table.add_columns(
+            "Sel",
             "Type",
+            "Cluster",
             "SD File",
             "SD Ext",
             "Drive File",
@@ -1297,9 +1285,9 @@ class PhotoDupeTUI(App):
         table.cursor_type = "row"
 
         if exifread is None:
-            self._set_summary("EXIF engine: exifread not installed. Install for best matching: pip install exifread")
+            self._set_summary("EXIF engine: exifread not installed. EXIF metadata/clusters unavailable.")
         else:
-            self._set_summary("EXIF engine: exifread enabled (capture-time matching active).")
+            self._set_summary("EXIF engine: exifread enabled (metadata + clustering; not used for matching).")
 
         self.recent_paths = load_recent_paths()
         self._refresh_recent_select("drive")
@@ -1323,6 +1311,14 @@ class PhotoDupeTUI(App):
             self.action_apply_rename()
         elif bid == "clear_btn":
             self.action_clear()
+        elif bid == "select_all_btn":
+            self.action_select_all()
+        elif bid == "select_none_btn":
+            self.action_select_none()
+        elif bid == "toggle_row_btn":
+            self.action_toggle_selected_row()
+        elif bid == "render_preview_btn":
+            self.action_render_preview()
         elif bid == "pick_drive_btn":
             self.action_pick_folder("drive_input")
         elif bid == "native_drive_btn":
@@ -1355,22 +1351,71 @@ class PhotoDupeTUI(App):
     def _set_preview(self, msg: str) -> None:
         self.query_one("#preview_panel", Static).update(msg)
 
+    def _is_auto_preview_enabled(self) -> bool:
+        try:
+            return self.query_one("#auto_preview_switch", Switch).value
+        except Exception:
+            return False
+
+    def _stop_preview_timer(self) -> None:
+        if self.preview_timer is not None:
+            try:
+                self.preview_timer.stop()
+            except Exception:
+                pass
+            self.preview_timer = None
+
+    def _invalidate_preview_pipeline(self) -> None:
+        self.preview_generation += 1
+        self.preview_pending = None
+        self._stop_preview_timer()
+
+    def _preview_block_cache_key(self, path: Path) -> Tuple[str, int, int]:
+        try:
+            st = path.stat()
+            return str(path.resolve()), int(st.st_mtime), int(st.st_size)
+        except Exception:
+            return str(path), 0, 0
+
+    def _preview_block_from_cache(self, path: Path) -> Optional[str]:
+        key = self._preview_block_cache_key(path)
+        cached = self.preview_block_cache.get(key)
+        if cached is None:
+            return None
+        # Keep recency for bounded LRU behavior.
+        self.preview_block_cache.move_to_end(key)
+        return cached
+
+    def _remember_preview_block(self, path: Path, block: str) -> None:
+        key = self._preview_block_cache_key(path)
+        self.preview_block_cache[key] = block
+        self.preview_block_cache.move_to_end(key)
+        while len(self.preview_block_cache) > PREVIEW_BLOCK_CACHE_LIMIT:
+            self.preview_block_cache.popitem(last=False)
+
     def _format_preview_block(self, label: str, path: Path) -> str:
+        cached = self._preview_block_from_cache(path)
+        if cached is not None:
+            return cached
+
         art, source = render_preview_ascii(path)
         if art:
-            return "\n".join(
+            block = "\n".join(
                 [
                     f"{label}: {path.name}",
                     art,
                     f"Source: {source}",
                 ]
             )
-        return "\n".join(
-            [
-                f"{label}: {path.name}",
-                f"Preview unavailable: {source}",
-            ]
-        )
+        else:
+            block = "\n".join(
+                [
+                    f"{label}: {path.name}",
+                    f"Preview unavailable: {source}",
+                ]
+            )
+        self._remember_preview_block(path, block)
+        return block
 
     def _format_preview_panel(self, row: MatchRow) -> str:
         sd_block = self._format_preview_block("SD", row.sd.path)
@@ -1378,29 +1423,61 @@ class PhotoDupeTUI(App):
         return "\n\n".join([sd_block, drive_block])
 
     def _update_preview_if_current(self, generation: int, text: str) -> None:
+        self.preview_inflight = False
         if generation != self.preview_generation:
+            self._start_pending_preview()
             return
         self._set_preview(text)
+        self._start_pending_preview()
 
     def _preview_worker(self, row: MatchRow, generation: int) -> None:
-        rendered = self._format_preview_panel(row)
+        try:
+            rendered = self._format_preview_panel(row)
+        except Exception as e:
+            rendered = f"Preview unavailable: {e}"
         self.call_from_thread(self._update_preview_if_current, generation, rendered)
 
-    def _request_preview_render(self, row: Optional[MatchRow]) -> None:
-        self.preview_generation += 1
-        generation = self.preview_generation
+    def _schedule_preview_start(self) -> None:
+        self._stop_preview_timer()
+        self.preview_timer = self.set_timer(PREVIEW_DEBOUNCE_SECONDS, self._start_pending_preview)
 
-        if row is None:
-            self._set_preview("Select a match to render previews.")
+    def _start_pending_preview(self) -> None:
+        self.preview_timer = None
+        if self.preview_inflight:
+            return
+        if self.preview_pending is None:
             return
 
-        self._set_preview("Rendering previews…")
+        row, generation = self.preview_pending
+        self.preview_pending = None
+        self.preview_inflight = True
         self.run_worker(
             lambda: self._preview_worker(row, generation),
+            group="preview",
             exclusive=False,
             name=f"preview_worker_{generation}",
             thread=True,
         )
+
+    def _request_preview_render(self, row: Optional[MatchRow], *, force: bool = False) -> None:
+        if row is None:
+            self.preview_generation += 1
+            self.preview_pending = None
+            self._stop_preview_timer()
+            self._set_preview("Select a match to render previews.")
+            return
+
+        if not force and not self._is_auto_preview_enabled():
+            # Don't touch the preview pipeline — a manual render may be
+            # in-flight or pending, and bumping the generation / clearing
+            # the pending state here would silently cancel it.
+            return
+
+        self.preview_generation += 1
+        generation = self.preview_generation
+        self.preview_pending = (row, generation)
+        self._set_preview("Rendering previews…")
+        self._schedule_preview_start()
 
     def _refresh_recent_select(self, key: str) -> None:
         select_id = "#drive_recent_select" if key == "drive" else "#sd_recent_select"
@@ -1462,9 +1539,11 @@ class PhotoDupeTUI(App):
             return "Select a match to compare metadata."
 
         keep_side, keep_reason = suggest_best_keep(row.sd, row.drive)
+        cluster = self._cluster_label_for(row)
         lines = [
             f"Best keep: {keep_side} ({keep_reason})",
             f"Match reason: {row.reason}",
+            f"Cluster: {cluster}",
             "",
             f"{'Field':<14} {'SD':<34} {'Drive'}",
             f"{'Name':<14} {row.sd.path.name:<34.34} {row.drive.path.name}",
@@ -1492,25 +1571,89 @@ class PhotoDupeTUI(App):
             return None
         return filtered[idx]
 
-    def _read_inputs(self) -> Tuple[Optional[Path], Optional[Path], str, int, bool]:
+    def _match_key(self, m: MatchRow) -> str:
+        return "|".join(
+            [
+                m.kind,
+                str(m.sd.path),
+                str(m.drive.path),
+                m.format_type,
+            ]
+        )
+
+    def _is_selected(self, m: MatchRow) -> bool:
+        return self._match_key(m) in self.selected_match_keys
+
+    def _cluster_label_for(self, m: MatchRow) -> str:
+        return self.cluster_by_match_key.get(self._match_key(m), "-")
+
+    def _rebuild_clusters(self) -> None:
+        self.cluster_by_match_key = {}
+
+        with_dt = [m for m in self.all_matches if m.sd.exif_dt is not None]
+        if not with_dt:
+            return
+
+        # Group bursts by camera model and close capture times.
+        with_dt.sort(
+            key=lambda m: (
+                (m.sd.camera_model or "").strip().lower(),
+                int(m.sd.exif_dt or 0),
+                str(m.sd.path),
+            )
+        )
+
+        cluster_index = 0
+        last_camera = ""
+        last_dt: Optional[int] = None
+        for m in with_dt:
+            camera = (m.sd.camera_model or "").strip().lower()
+            dt = int(m.sd.exif_dt or 0)
+            is_new_cluster = (
+                cluster_index == 0
+                or camera != last_camera
+                or last_dt is None
+                or (dt - last_dt) > PHOTO_CLUSTER_GAP_SECONDS
+            )
+            if is_new_cluster:
+                cluster_index += 1
+            self.cluster_by_match_key[self._match_key(m)] = f"C{cluster_index:03d}"
+            last_camera = camera
+            last_dt = dt
+
+    def _set_selected(self, m: MatchRow, selected: bool) -> None:
+        k = self._match_key(m)
+        if selected:
+            self.selected_match_keys.add(k)
+        else:
+            self.selected_match_keys.discard(k)
+
+    def _selected_filtered_matches(self) -> List[MatchRow]:
+        return [m for m in self._current_filtered_matches() if self._is_selected(m)]
+
+    def _select_all_filtered(self) -> int:
+        filtered = self._current_filtered_matches()
+        for m in filtered:
+            self._set_selected(m, True)
+        return len(filtered)
+
+    def _select_none_filtered(self) -> int:
+        filtered = self._current_filtered_matches()
+        for m in filtered:
+            self._set_selected(m, False)
+        return len(filtered)
+
+    def _read_inputs(self) -> Tuple[Optional[Path], Optional[Path], str, bool]:
         drive = self.query_one("#drive_input", Input).value.strip()
         sd = self.query_one("#sd_input", Input).value.strip()
         prefix = self.query_one("#prefix_input", Input).value.strip() or "COPIED_"
 
         substring = self.query_one("#substring_switch", Switch).value
-        tol_raw = self.query_one("#tol_input", Input).value.strip()
-
-        tol = 2
-        try:
-            tol = int(tol_raw)
-            tol = max(0, min(tol, 10))
-        except Exception:
-            tol = 2
 
         if not drive or not sd:
-            return None, None, prefix, tol, substring
+            return None, None, prefix, substring
 
-        return Path(drive).expanduser(), Path(sd).expanduser(), prefix, tol, substring
+        return Path(drive).expanduser(), Path(sd).expanduser(), prefix, substring
 
     def _refresh_formats_list(self) -> None:
         sl = self.query_one("#formats_list", SelectionList)
@@ -1538,10 +1681,13 @@ class PhotoDupeTUI(App):
         table.clear()
 
         filtered = self._current_filtered_matches()
+        focus_key = self._match_key(self.preview_focus_row) if self.preview_focus_row else None
         for i, m in enumerate(filtered):
             keep_side, keep_reason = suggest_best_keep(m.sd, m.drive)
             table.add_row(
+                "[x]" if self._is_selected(m) else "[ ]",
                 m.kind,
+                self._cluster_label_for(m),
                 m.sd.path.name,
                 m.sd.ext,
                 m.drive.path.name,
@@ -1556,14 +1702,28 @@ class PhotoDupeTUI(App):
         exact_n = counts.get("EXACT", 0)
         cross_n = counts.get("CROSS", 0)
         unique_sd = len(self._unique_sd_files(filtered))
+        selected_filtered = self._selected_filtered_matches()
+        selected_rows = len(selected_filtered)
+        selected_unique_sd = len(self._unique_sd_files(selected_filtered))
+        visible_clusters = {
+            self._cluster_label_for(m)
+            for m in filtered
+            if self._cluster_label_for(m) != "-"
+        }
         self._set_status(
             f"Showing {len(filtered)} matches — Exact: {exact_n} | Cross: {cross_n} | "
-            f"Unique SD files: {unique_sd} | Conversions enabled: "
+            f"Unique SD files: {unique_sd} | Selected rows: {selected_rows} "
+            f"(unique SD {selected_unique_sd}) | Clusters: {len(visible_clusters)} | Conversions enabled: "
             f"{len(self.enabled_cross_types)}/{len(self.cross_types)}"
         )
-        first = filtered[0] if filtered else None
-        self._set_compare(self._format_compare_panel(first))
-        self._request_preview_render(first)
+        focus = None
+        if focus_key is not None:
+            focus = next((m for m in filtered if self._match_key(m) == focus_key), None)
+        if focus is None:
+            focus = filtered[0] if filtered else None
+        self.preview_focus_row = focus
+        self._set_compare(self._format_compare_panel(focus))
+        self._request_preview_render(focus)
 
     # -----------------
     # Actions
@@ -1624,10 +1784,15 @@ class PhotoDupeTUI(App):
 
     def action_clear(self) -> None:
         self._clear_pending_confirmation()
+        self._invalidate_preview_pipeline()
+        self.preview_inflight = False
         self.all_matches = []
         self.cross_types = []
         self.enabled_cross_types = set()
+        self.selected_match_keys.clear()
+        self.cluster_by_match_key = {}
         self.last_sd_root = None
+        self.preview_focus_row = None
         self.query_one("#formats_list", SelectionList).clear_options()
         self.query_one("#matches_table", DataTable).clear()
         self._set_compare("Select a match to compare metadata.")
@@ -1636,7 +1801,7 @@ class PhotoDupeTUI(App):
 
     def action_scan(self) -> None:
         self._clear_pending_confirmation()
-        drive_path, sd_path, _, tol, substring = self._read_inputs()
+        drive_path, sd_path, _, substring = self._read_inputs()
         if drive_path is None or sd_path is None:
             self._set_status("Both Drive path and SD path are required.")
             return
@@ -1655,13 +1820,13 @@ class PhotoDupeTUI(App):
         self.last_sd_root = sd_path
         self._set_status("Starting scan…")
         self.run_worker(
-            lambda: self._scan_worker(drive_path, sd_path, tol, substring),
+            lambda: self._scan_worker(drive_path, sd_path, substring),
             exclusive=True,
             name="scan_worker",
             thread=True,
         )
 
-    def _scan_worker(self, drive_path: Path, sd_path: Path, tol: int, substring: bool) -> None:
+    def _scan_worker(self, drive_path: Path, sd_path: Path, substring: bool) -> None:
         worker = get_current_worker()
 
         def emit(msg: str) -> None:
@@ -1691,19 +1856,21 @@ class PhotoDupeTUI(App):
             sd_infos,
             drive_infos,
             enable_substring_fallback=substring,
-            exif_tolerance_seconds=tol,
+            exif_tolerance_seconds=0,
         )
 
         def done() -> None:
             self.all_matches = matches
             self.cross_types = cross_types
             self.enabled_cross_types = set(cross_types)
+            self.selected_match_keys = {self._match_key(m) for m in matches}
+            self._rebuild_clusters()
             self._refresh_formats_list()
             self._refresh_matches_table()
 
             if not matches:
                 self._set_summary(
-                    f"No matches found. EXIF tol={tol}s, substring fallback={'on' if substring else 'off'}."
+                    f"No matches found. substring fallback={'on' if substring else 'off'}."
                 )
                 return
 
@@ -1711,7 +1878,7 @@ class PhotoDupeTUI(App):
             cross_total = sum(1 for m in matches if m.kind == "CROSS")
             self._set_summary(
                 f"Scan complete — matches: {len(matches)} (Exact {exact_total}, Cross {cross_total}). "
-                f"EXIF tol={tol}s, substring fallback={'on' if substring else 'off'}."
+                f"substring fallback={'on' if substring else 'off'}."
             )
 
         self.call_from_thread(done)
@@ -1725,8 +1892,33 @@ class PhotoDupeTUI(App):
         if event.data_table.id != "matches_table":
             return
         row = self._match_from_row_key(event.row_key)
+        self.preview_focus_row = row
         self._set_compare(self._format_compare_panel(row))
         self._request_preview_render(row)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "matches_table":
+            return
+        row = self._match_from_row_key(event.row_key)
+        if row is None:
+            return
+        self._set_selected(row, not self._is_selected(row))
+        self._refresh_matches_table()
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        sid = event.switch.id
+        if sid != "auto_preview_switch":
+            return
+
+        if event.value:
+            self._set_status("Auto-preview enabled.")
+            self._request_preview_render(self.preview_focus_row)
+            return
+
+        self._invalidate_preview_pipeline()
+        self.preview_inflight = False
+        self._set_preview("Auto-preview is off. Press 'Render preview' for the selected row.")
+        self._set_status("Auto-preview disabled.")
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if self.recent_events_suspended:
@@ -1756,13 +1948,43 @@ class PhotoDupeTUI(App):
             return
         self.push_screen(QuarantineViewer(quarantine_root_for(sd_root)))
 
+    def action_render_preview(self) -> None:
+        row = self.preview_focus_row
+        if row is None:
+            filtered = self._current_filtered_matches()
+            row = filtered[0] if filtered else None
+            self.preview_focus_row = row
+        if row is None:
+            self._set_preview("No match selected. Scan and highlight a row first.")
+            return
+        self._request_preview_render(row, force=True)
+
+    def action_select_all(self) -> None:
+        count = self._select_all_filtered()
+        self._refresh_matches_table()
+        self._set_status(f"Selected all visible rows ({count}).")
+
+    def action_select_none(self) -> None:
+        count = self._select_none_filtered()
+        self._refresh_matches_table()
+        self._set_status(f"Cleared selection for visible rows ({count}).")
+
+    def action_toggle_selected_row(self) -> None:
+        table = self.query_one("#matches_table", DataTable)
+        row = self._match_from_row_key(table.cursor_row_key)
+        if row is None:
+            self._set_status("No row highlighted to toggle.")
+            return
+        self._set_selected(row, not self._is_selected(row))
+        self._refresh_matches_table()
+
     def action_quarantine(self) -> None:
         if not self.all_matches:
             self._set_status("No matches loaded. Scan first.")
             return
-        filtered = self._current_filtered_matches()
-        if not filtered:
-            self._set_status("No matches after filters.")
+        selected = self._selected_filtered_matches()
+        if not selected:
+            self._set_status("No selected rows after filters.")
             return
 
         sd_root = self._get_sd_root_from_input() or self.last_sd_root
@@ -1770,7 +1992,7 @@ class PhotoDupeTUI(App):
             self._set_status("Set a valid SD path before quarantining.")
             return
 
-        total = len(self._unique_sd_files(filtered))
+        total = len(self._unique_sd_files(selected))
         if total == 0:
             self._set_status("No files to quarantine.")
             return
@@ -1779,7 +2001,7 @@ class PhotoDupeTUI(App):
 
         self._set_status("Moving selected SD matches to quarantine…")
         self.run_worker(
-            lambda: self._quarantine_worker(filtered, sd_root),
+            lambda: self._quarantine_worker(selected, sd_root),
             exclusive=True,
             name="quarantine_worker",
             thread=True,
@@ -1921,18 +2143,18 @@ class PhotoDupeTUI(App):
         if prefix_err:
             self._set_status(prefix_err)
             return
-        filtered = self._current_filtered_matches()
-        if not filtered:
-            self._set_status("No matches after filters.")
+        selected = self._selected_filtered_matches()
+        if not selected:
+            self._set_status("No selected rows after filters.")
             return
 
-        total = len(self._unique_sd_files(filtered))
+        total = len(self._unique_sd_files(selected))
         if not self._confirm_or_arm("rename", "legacy rename", total):
             return
 
         self._set_status(f"Applying rename prefix '{prefix}'…")
         self.run_worker(
-            lambda: self._apply_worker(filtered, prefix),
+            lambda: self._apply_worker(selected, prefix),
             exclusive=True,
             name="apply_worker",
             thread=True,

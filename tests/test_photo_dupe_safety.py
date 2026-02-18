@@ -143,6 +143,33 @@ class SafetyRulesTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].reason, "Substring stem match (legacy)")
 
+    def test_exif_time_is_not_used_for_matching(self) -> None:
+        sd = FileInfo(
+            path=Path("/sd/BURST_0001.jpg"),
+            stem="BURST_0001",
+            ext=".jpg",
+            size=1000,
+            mtime=0,
+            exif_dt=1700000000,
+            camera_model="Fujifilm X-T5",
+        )
+        drv = FileInfo(
+            path=Path("/drv/BURST_0002.jpg"),
+            stem="BURST_0002",
+            ext=".jpg",
+            size=1000,
+            mtime=0,
+            exif_dt=1700000000,
+            camera_model="Fujifilm X-T5",
+        )
+        matches, _ = find_matches_hybrid(
+            [sd],
+            [drv],
+            enable_substring_fallback=False,
+            exif_tolerance_seconds=2,
+        )
+        self.assertEqual(matches, [])
+
     def test_partial_and_full_hash_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

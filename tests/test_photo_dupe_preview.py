@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -66,6 +67,18 @@ class PreviewHelpersTests(unittest.TestCase):
 
             self.assertIsNone(art)
             self.assertIn("chafa unavailable", note)
+
+    def test_render_preview_ascii_reports_chafa_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jpg = Path(tmp) / "img.jpg"
+            jpg.write_bytes(b"jpg")
+
+            with patch("photo_dupe.shutil.which", side_effect=lambda name: "/usr/bin/chafa" if name == "chafa" else None):
+                with patch("photo_dupe.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["chafa"], timeout=1)):
+                    art, note = render_preview_ascii(jpg)
+
+            self.assertIsNone(art)
+            self.assertIn("timeout", note)
 
 
 if __name__ == "__main__":

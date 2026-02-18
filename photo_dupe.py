@@ -49,6 +49,7 @@ from textual.widgets import (
     SelectionList,
     Switch,
     DirectoryTree,
+    ProgressBar,
 )
 from textual.reactive import reactive
 from textual.worker import get_current_worker
@@ -482,6 +483,7 @@ def scan_directory_parallel_infos(
     directory: Path,
     description: str,
     emit_progress=None,
+    progress_callback=None,
 ) -> List[FileInfo]:
     global PROCESS_POOL_BROKEN, PROCESS_POOL_BROKEN_REASON
     all_files = collect_all_files(directory)
@@ -506,6 +508,8 @@ def scan_directory_parallel_infos(
                 completed += 1
                 if emit_progress:
                     emit_progress(f"Scanning {description}: {completed}/{len(chunks)} chunks")
+                if progress_callback:
+                    progress_callback(completed, len(chunks))
         return out
 
     # In TUI we scan from a thread worker; process pools from non-main threads are
@@ -1152,37 +1156,43 @@ class PhotoDupeTUI(App):
     CSS = """
     Screen { layout: vertical; }
 
-    #top { height: auto; max-height: 55%; overflow-y: auto; padding: 1; }
+    #toolbar { height: auto; max-height: 14; padding: 0 1; }
+    #paths_row { height: auto; }
+    #paths_row .path_col { width: 1fr; padding-right: 1; }
+    #paths_row .path_col Input { width: 1fr; }
+    #paths_row .path_col Select { width: 1fr; }
+    #paths_row #btn_col { width: auto; min-width: 18; }
+    #paths_row #btn_col Button { width: 100%; }
+    #options_row { height: auto; margin-top: 1; }
+    #options_row Button { width: auto; min-width: 10; }
+    #options_row Static { width: auto; padding: 0 1 0 0; }
+    #status { height: auto; }
+    #progress_bar { height: 1; display: none; }
+    #progress_bar.visible { display: block; }
+
     #main { height: 1fr; min-height: 12; }
+    #table_area { height: 3fr; min-height: 8; }
+    #matches_table { height: 1fr; }
+    #detail_area { height: 2fr; min-height: 6; }
+    #compare_panel { width: 1fr; height: 1fr; border: round $accent; padding: 1; overflow-y: auto; }
+    #preview_panel { width: 1fr; height: 1fr; border: round $accent; padding: 1; overflow-y: auto; }
 
-    #left { width: 26%; height: 1fr; }
-    #middle { width: 44%; height: 1fr; }
-    #preview_col { width: 30%; height: 1fr; }
-
-    #paths { height: auto; }
-    #toggles { height: auto; margin-top: 1; }
-    #actions_top { height: auto; margin-top: 1; }
-    #actions_bottom { height: auto; margin-top: 1; }
-    #paths Select { width: 1fr; margin-top: 1; }
-    #workflow_hint { height: auto; padding: 0 0 1 0; }
-    #status { height: auto; padding: 1 0; }
-    #summary { height: auto; padding: 0 0 1 0; }
-    #selection_hint { height: auto; padding: 0 0 1 0; }
-
-    #matches_table { height: 2fr; min-height: 8; }
-    #compare_panel { height: 1fr; min-height: 6; border: round $accent; padding: 1; }
-    #preview_panel { height: 1fr; min-height: 12; border: round $accent; padding: 1; overflow-y: auto; }
-    SelectionList { height: 1fr; min-height: 6; }
-    #match_select_actions { height: auto; margin-top: 1; }
-    #match_select_actions Button { min-width: 11; }
-    #preview_action_row { height: auto; margin-top: 1; }
-    #preview_action_row Button { min-width: 14; }
-
-    .row { height: auto; }
-    .row Input { width: 1fr; min-width: 16; }
-    .row Button { width: auto; min-width: 9; margin-left: 1; }
-    #actions_top Button, #actions_bottom Button { width: auto; min-width: 14; }
+    #formats_popup { height: auto; max-height: 10; display: none; }
+    #formats_popup.visible { display: block; }
+    #formats_popup SelectionList { height: auto; max-height: 8; }
     """
+
+    BINDINGS = [
+        ("s", "scan", "Scan"),
+        ("space", "toggle_selected_row", "Toggle"),
+        ("ctrl+a", "select_all", "Sel all"),
+        ("ctrl+n", "select_none", "Sel none"),
+        ("p", "render_preview", "Preview"),
+        ("f", "toggle_formats", "Filters"),
+        ("q", "quarantine", "Quarantine"),
+        ("u", "undo_last_apply", "Undo"),
+        ("c", "clear", "Clear"),
+    ]
 
     all_matches: List[MatchRow] = []
     cross_types: List[str] = []
@@ -1200,94 +1210,60 @@ class PhotoDupeTUI(App):
     preview_focus_row: Optional[MatchRow] = None
     selected_match_keys: set[str] = set()
     cluster_by_match_key: Dict[str, str] = {}
+    rename_prefix: str = "COPIED_"
 
     def compose(self) -> ComposeResult:
         yield Header()
 
-        with Vertical(id="top"):
-            with Vertical(id="paths"):
-                yield Static("Drive path (destination / archive):")
-                with Horizontal(classes="row"):
+        with Vertical(id="toolbar"):
+            with Horizontal(id="paths_row"):
+                with Vertical(classes="path_col"):
+                    yield Static("Drive:")
                     yield Input(placeholder="/Volumes/Photos or D:\\Photos", id="drive_input")
-                    yield Button("Pick…", id="pick_drive_btn")
-                    yield Button("Native…", id="native_drive_btn")
-                yield Select([], prompt="Recent drive paths", allow_blank=True, compact=True, id="drive_recent_select")
-
-                yield Static("SD card path (source):")
-                with Horizontal(classes="row"):
+                    yield Select([], prompt="Recent drives", allow_blank=True, compact=True, id="drive_recent_select")
+                with Vertical(classes="path_col"):
+                    yield Static("SD:")
                     yield Input(placeholder="/Volumes/SDCARD or E:\\DCIM", id="sd_input")
-                    yield Button("Pick…", id="pick_sd_btn")
-                    yield Button("Native…", id="native_sd_btn")
-                yield Select([], prompt="Recent SD paths", allow_blank=True, compact=True, id="sd_recent_select")
-
-                yield Static("Rename prefix (non-destructive):")
-                yield Input(value="COPIED_", id="prefix_input")
-
-            with Horizontal(id="toggles"):
-                yield Static("Legacy substring fallback:")
+                    yield Select([], prompt="Recent SD", allow_blank=True, compact=True, id="sd_recent_select")
+                with Vertical(id="btn_col"):
+                    yield Button("Pick drive", id="pick_drive_btn")
+                    yield Button("Pick SD", id="pick_sd_btn")
+                    yield Button("Scan", id="scan_btn", variant="primary")
+            with Horizontal(id="options_row"):
+                yield Static("Substring:")
                 yield Switch(value=True, id="substring_switch")
-                yield Static("Exact + legacy substring matching")
-
-            with Horizontal(id="actions_top"):
-                yield Button("Scan", id="scan_btn", variant="primary")
-                yield Button("Quarantine selected", id="quarantine_btn", variant="warning")
-                yield Button("Undo quarantine", id="undo_btn")
-                yield Button("View quarantine", id="view_quarantine_btn")
-
-            with Horizontal(id="actions_bottom"):
-                yield Button("Rename selected (legacy)", id="apply_btn")
+                yield Static("Auto preview:")
+                yield Switch(value=False, id="auto_preview_switch")
+                yield Button("Quarantine", id="quarantine_btn", variant="warning")
+                yield Button("Undo", id="undo_btn")
+                yield Button("View Q", id="view_quarantine_btn")
+                yield Button("Filters", id="filters_btn")
                 yield Button("Clear", id="clear_btn")
 
-            yield Static("Workflow: Scan -> review -> Render preview as needed -> Quarantine selected.", id="workflow_hint")
-            yield Static("", id="status")
-            yield Static("", id="summary")
+        yield Static("", id="status")
+        yield ProgressBar(total=100, id="progress_bar")
 
-        with Horizontal(id="main"):
-            with Vertical(id="left"):
-                yield Static("Cross-format filters (toggle conversions)")
+        with Vertical(id="main"):
+            with Vertical(id="formats_popup"):
+                yield Static("Cross-format filters:")
                 yield SelectionList(id="formats_list")
-                with Horizontal(id="match_select_actions"):
-                    yield Button("Select all", id="select_all_btn")
-                    yield Button("Select none", id="select_none_btn")
-                    yield Button("Toggle row", id="toggle_row_btn")
-                with Horizontal(id="preview_action_row"):
-                    yield Button("Render preview", id="render_preview_btn")
-                    yield Static("Auto preview:")
-                    yield Switch(value=False, id="auto_preview_switch")
-
-            with Vertical(id="middle"):
-                yield Static("Matches (review) — includes Reason")
-                yield Static("Selection: use Select all/none, Toggle row, or Enter on a row.", id="selection_hint")
+            with Vertical(id="table_area"):
                 yield DataTable(id="matches_table")
-                yield Static("Compare panel")
-                yield Static("Select a match to compare metadata.", id="compare_panel")
-
-            with Vertical(id="preview_col"):
-                yield Static("Preview panel")
-                yield Static("Select a match to render previews.", id="preview_panel")
+            with Horizontal(id="detail_area"):
+                yield Static("Select a match to compare.", id="compare_panel")
+                yield Static("Select a match to preview.", id="preview_panel")
 
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#matches_table", DataTable)
-        table.add_columns(
-            "Sel",
-            "Type",
-            "Cluster",
-            "SD File",
-            "SD Ext",
-            "Drive File",
-            "Drive Ext",
-            "Conversion",
-            "Keep",
-            "Reason",
-        )
+        table.add_columns("Sel", "SD File", "Drive File", "Type", "Cluster", "Reason")
         table.cursor_type = "row"
 
         if exifread is None:
-            self._set_summary("EXIF engine: exifread not installed. EXIF metadata/clusters unavailable.")
+            self._set_status("EXIF engine: exifread not installed. EXIF metadata/clusters unavailable.")
         else:
-            self._set_summary("EXIF engine: exifread enabled (metadata + clustering; not used for matching).")
+            self._set_status("EXIF engine: exifread enabled (metadata + clustering; not used for matching).")
 
         self.recent_paths = load_recent_paths()
         self._refresh_recent_select("drive")
@@ -1307,26 +1283,14 @@ class PhotoDupeTUI(App):
             self.action_undo_last_apply()
         elif bid == "view_quarantine_btn":
             self.action_view_quarantine()
-        elif bid == "apply_btn":
-            self.action_apply_rename()
         elif bid == "clear_btn":
             self.action_clear()
-        elif bid == "select_all_btn":
-            self.action_select_all()
-        elif bid == "select_none_btn":
-            self.action_select_none()
-        elif bid == "toggle_row_btn":
-            self.action_toggle_selected_row()
-        elif bid == "render_preview_btn":
-            self.action_render_preview()
         elif bid == "pick_drive_btn":
             self.action_pick_folder("drive_input")
-        elif bid == "native_drive_btn":
-            self.action_pick_folder_native("drive_input")
         elif bid == "pick_sd_btn":
             self.action_pick_folder("sd_input")
-        elif bid == "native_sd_btn":
-            self.action_pick_folder_native("sd_input")
+        elif bid == "filters_btn":
+            self.action_toggle_formats()
 
     # -----------------
     # Messages
@@ -1341,9 +1305,6 @@ class PhotoDupeTUI(App):
 
     def _set_status(self, msg: str) -> None:
         self.query_one("#status", Static).update(msg)
-
-    def _set_summary(self, msg: str) -> None:
-        self.query_one("#summary", Static).update(msg)
 
     def _set_compare(self, msg: str) -> None:
         self.query_one("#compare_panel", Static).update(msg)
@@ -1646,7 +1607,7 @@ class PhotoDupeTUI(App):
     def _read_inputs(self) -> Tuple[Optional[Path], Optional[Path], str, bool]:
         drive = self.query_one("#drive_input", Input).value.strip()
         sd = self.query_one("#sd_input", Input).value.strip()
-        prefix = self.query_one("#prefix_input", Input).value.strip() or "COPIED_"
+        prefix = self.rename_prefix
 
         substring = self.query_one("#substring_switch", Switch).value
 
@@ -1683,17 +1644,12 @@ class PhotoDupeTUI(App):
         filtered = self._current_filtered_matches()
         focus_key = self._match_key(self.preview_focus_row) if self.preview_focus_row else None
         for i, m in enumerate(filtered):
-            keep_side, keep_reason = suggest_best_keep(m.sd, m.drive)
             table.add_row(
                 "[x]" if self._is_selected(m) else "[ ]",
+                m.sd.path.name,
+                m.drive.path.name,
                 m.kind,
                 self._cluster_label_for(m),
-                m.sd.path.name,
-                m.sd.ext,
-                m.drive.path.name,
-                m.drive.ext,
-                m.format_type,
-                f"{keep_side} ({keep_reason})",
                 m.reason,
                 key=str(i),
             )
@@ -1731,6 +1687,9 @@ class PhotoDupeTUI(App):
 
     def action_pick_folder(self, field_id: str) -> None:
         self._clear_pending_confirmation()
+        if sys.platform == "darwin":
+            self.action_pick_folder_native(field_id)
+            return
         # Start picker at current value if valid, else home/root
         raw = self.query_one(f"#{field_id}", Input).value.strip()
         start = None
@@ -1793,9 +1752,10 @@ class PhotoDupeTUI(App):
         self.cluster_by_match_key = {}
         self.last_sd_root = None
         self.preview_focus_row = None
+        self.query_one("#formats_popup").remove_class("visible")
         self.query_one("#formats_list", SelectionList).clear_options()
         self.query_one("#matches_table", DataTable).clear()
-        self._set_compare("Select a match to compare metadata.")
+        self._set_compare("Select a match to compare.")
         self._request_preview_render(None)
         self._set_status("Cleared. Pick folders and Scan.")
 
@@ -1826,32 +1786,68 @@ class PhotoDupeTUI(App):
             thread=True,
         )
 
+    def _show_progress(self, progress: float) -> None:
+        bar = self.query_one("#progress_bar", ProgressBar)
+        bar.update(progress=progress)
+
+    def _set_progress_visible(self, visible: bool) -> None:
+        bar = self.query_one("#progress_bar")
+        if visible:
+            bar.add_class("visible")
+            self._show_progress(0)
+        else:
+            bar.remove_class("visible")
+
     def _scan_worker(self, drive_path: Path, sd_path: Path, substring: bool) -> None:
         worker = get_current_worker()
+
+        # Phase weights: drive scan 45%, SD scan 45%, matching 10%
+        phase_offset = 0.0
 
         def emit(msg: str) -> None:
             if worker.is_cancelled:
                 return
             self.call_from_thread(self._set_status, msg)
 
+        def make_chunk_cb(offset: float, weight: float):
+            def cb(completed: int, total: int) -> None:
+                if worker.is_cancelled:
+                    return
+                pct = offset + weight * (completed / max(total, 1))
+                self.call_from_thread(self._show_progress, pct * 100)
+            return cb
+
+        self.call_from_thread(self._set_progress_visible, True)
+
         emit(f"Scanning drive: {drive_path}")
-        drive_infos = scan_directory_parallel_infos(drive_path, "files on drive", emit_progress=emit)
+        drive_infos = scan_directory_parallel_infos(
+            drive_path, "files on drive",
+            emit_progress=emit,
+            progress_callback=make_chunk_cb(0.0, 0.45),
+        )
         if worker.is_cancelled:
             return
 
         emit(f"Scanning SD card: {sd_path}")
-        sd_infos = scan_directory_parallel_infos(sd_path, "files on SD card", emit_progress=emit)
+        sd_infos = scan_directory_parallel_infos(
+            sd_path, "files on SD card",
+            emit_progress=emit,
+            progress_callback=make_chunk_cb(0.45, 0.45),
+        )
         if worker.is_cancelled:
             return
 
         if not sd_infos:
             self.call_from_thread(self._set_status, "No files found on SD card.")
+            self.call_from_thread(self._set_progress_visible, False)
             return
         if not drive_infos:
             self.call_from_thread(self._set_status, "No files found on drive.")
+            self.call_from_thread(self._set_progress_visible, False)
             return
 
         emit("Matching (HYBRID)…")
+        self.call_from_thread(self._show_progress, 90)
         matches, cross_types = find_matches_hybrid(
             sd_infos,
             drive_infos,
@@ -1860,6 +1856,7 @@ class PhotoDupeTUI(App):
         )
 
         def done() -> None:
+            self._show_progress(100)
             self.all_matches = matches
             self.cross_types = cross_types
             self.enabled_cross_types = set(cross_types)
@@ -1867,16 +1864,17 @@ class PhotoDupeTUI(App):
             self._rebuild_clusters()
             self._refresh_formats_list()
             self._refresh_matches_table()
+            self._set_progress_visible(False)
 
             if not matches:
-                self._set_summary(
+                self._set_status(
                     f"No matches found. substring fallback={'on' if substring else 'off'}."
                 )
                 return
 
             exact_total = sum(1 for m in matches if m.kind == "EXACT")
             cross_total = sum(1 for m in matches if m.kind == "CROSS")
-            self._set_summary(
+            self._set_status(
                 f"Scan complete — matches: {len(matches)} (Exact {exact_total}, Cross {cross_total}). "
                 f"substring fallback={'on' if substring else 'off'}."
             )
@@ -1884,7 +1882,11 @@ class PhotoDupeTUI(App):
         self.call_from_thread(done)
 
     def on_selection_list_selected_changed(self, event: SelectionList.SelectedChanged) -> None:
+        if event.selection_list.id != "formats_list":
+            return
         sl = self.query_one("#formats_list", SelectionList)
+        if sl.option_count == 0:
+            return
         self.enabled_cross_types = {str(value) for value in sl.selected}
         self._refresh_matches_table()
 
@@ -1948,6 +1950,9 @@ class PhotoDupeTUI(App):
             return
         self.push_screen(QuarantineViewer(quarantine_root_for(sd_root)))
 
+    def action_toggle_formats(self) -> None:
+        self.query_one("#formats_popup").toggle_class("visible")
+
     def action_render_preview(self) -> None:
         row = self.preview_focus_row
         if row is None:
@@ -1971,7 +1976,11 @@ class PhotoDupeTUI(App):
 
     def action_toggle_selected_row(self) -> None:
         table = self.query_one("#matches_table", DataTable)
-        row = self._match_from_row_key(table.cursor_row_key)
+        try:
+            cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+            row = self._match_from_row_key(cell_key.row_key)
+        except Exception:
+            row = None
         if row is None:
             self._set_status("No row highlighted to toggle.")
             return
@@ -2138,7 +2147,7 @@ class PhotoDupeTUI(App):
             self._set_status("No matches loaded. Scan first.")
             return
 
-        prefix = self.query_one("#prefix_input", Input).value.strip() or "COPIED_"
+        prefix = self.rename_prefix
         prefix_err = validate_prefix(prefix)
         if prefix_err:
             self._set_status(prefix_err)

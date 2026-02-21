@@ -1,0 +1,14 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "photo_dupe.py",
+    "tests"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "venv": ".venv"
+    }
+  ]
+}

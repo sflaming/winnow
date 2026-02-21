@@ -22,32 +22,34 @@ uv run python -m pytest tests/test_photo_dupe_safety.py
 uv run python -m pytest tests/test_photo_dupe_safety.py::SafetyRulesTests::test_paths_overlap_detects_same_and_nested
 ```
 
-Uses `uv` for dependency management (Python 3.13). Dependencies: `textual`, `exifread`.
+Uses `uv` for dependency management (Python 3.13). Dependencies: `textual`, `exifread`, `textual-image`.
 
 ## Architecture
 
 Everything lives in a single file: `photo_dupe.py`. Key sections in order:
 
-1. **Config constants** — extension sets (BLACKLIST, EXIF, RAW, IMAGE preview), hash parameters, preview settings, quarantine/transaction log names
+1. **Config constants** — extension sets (BLACKLIST, EXIF, RAW, IMAGE preview), hash parameters, quarantine/transaction log names
 2. **Data models** — `FileInfo` (frozen dataclass per file with EXIF metadata) and `MatchRow` (a paired SD↔Drive match with kind/reason)
 3. **Screens** — `FolderPicker` (modal directory tree picker), `QuarantineViewer` (read-only list of quarantined files)
 4. **EXIF helpers** — `read_exif_quick()` extracts DateTimeOriginal, camera model, lens, dimensions via `exifread`
-5. **Scanning** — `scan_directory_parallel_infos()` walks a directory, chunks the file list, and processes in parallel (ThreadPoolExecutor when off main thread, ProcessPoolExecutor with fallback otherwise)
-6. **Matching** — `find_matches_hybrid()` matches SD→Drive by exact stem+ext+size (with partial/full blake2b hash disambiguation), optional substring fallback, and optional cross-format detection. EXIF-time correlation is intentionally disabled to avoid burst-shot false positives.
-7. **Safety** — quarantine moves files to `.photo_dupe_quarantine/` with a JSONL transaction log (`.photo_dupe_transactions.jsonl`), enabling undo. Destructive actions require a second button press within a confirmation window.
-8. **Preview pipeline** — resolves preview images (direct for JPG/PNG, exiftool/rawpy extraction for RAW), renders ASCII art via `chafa`, with debounced async workers, generation tracking, and an LRU block cache.
-9. **TUI (`PhotoDupeTUI`)** — the main Textual `App`. Three-column layout: left (cross-format filters + selection controls), middle (matches DataTable + compare panel), right (ASCII preview panel). Workers run on background threads via `run_worker(thread=True)` and post back with `call_from_thread`.
+5. **Lazy EXIF loading** — `load_exif_for_fileinfo()` and `load_exif_for_matches()` defer EXIF reading to post-match phase for speed. Module-level `_exif_cache` avoids re-reading.
+6. **Scanning** — `scan_directory_parallel_infos()` walks a directory, chunks the file list, and processes in parallel (ThreadPoolExecutor when off main thread, ProcessPoolExecutor with fallback otherwise). EXIF is NOT read during scan — only path/stem/ext/size/mtime are collected.
+7. **Matching** — `find_matches_hybrid()` matches SD→Drive by exact stem+ext+size (with partial/full blake2b hash disambiguation), optional substring fallback. `find_content_matches()` catches renamed duplicates via size+hash matching. EXIF-time correlation is intentionally disabled to avoid burst-shot false positives.
+8. **Safety** — quarantine moves files to `.photo_dupe_quarantine/` with a JSONL transaction log (`.photo_dupe_transactions.jsonl`), enabling undo. Destructive actions require a second button press within a confirmation window.
+9. **Preview pipeline** — resolves preview images (direct for JPG/PNG, exiftool/rawpy extraction for RAW), renders side-by-side via `textual-image` widgets (sixel/iTerm2/kitty with auto-fallback).
+10. **TUI (`PhotoDupeTUI`)** — the main Textual `App`. Three-column layout: left (cross-format filters + selection controls), middle (matches DataTable + compare panel), right (side-by-side image preview panel). Workers run on background threads via `run_worker(thread=True)` and post back with `call_from_thread`.
 
 ## Key Design Decisions
 
+- EXIF is deferred to post-match — scanning only collects stat metadata; EXIF is loaded lazily for matched files only, dramatically reducing scan time.
 - Matching never uses EXIF timestamps (burst-shot false-positive risk); EXIF data is display/cluster-only.
+- Content-based matching (size → partial hash → full hash) catches renamed duplicates that name-based matching misses.
 - Clustering groups matches by camera model + capture time proximity for review convenience.
 - The scan always uses ThreadPoolExecutor when running from a worker thread (macOS process pool issues).
-- Preview rendering is debounced and generation-gated to avoid stale updates overwriting current ones.
+- Preview uses `textual-image` for side-by-side real image display (sixel/iTerm2/kitty with auto-fallback).
 - All file mutations (quarantine, undo, rename) are exclusive workers — only one can run at a time.
 
 ## Optional External Tools (for preview)
 
 - `exiftool` — extracts embedded JPEG previews from RAW files
 - `rawpy` + `Pillow` — fallback RAW decode if exiftool unavailable
-- `chafa` — renders images as ASCII art in the terminal preview panel

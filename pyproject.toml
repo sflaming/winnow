@@ -9,4 +9,5 @@ dependencies = [
     "pillow>=12.1.1",
     "rawpy<=0.25.1",
     "textual>=8.0.0",
+    "textual-image[textual]>=0.8.5",
 ]

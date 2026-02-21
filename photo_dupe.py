@@ -31,10 +31,18 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from collections import defaultdict, Counter, OrderedDict
+from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable, cast
 from datetime import datetime
+
+try:
+    from textual_image.renderable import Image as _RendImage  # noqa: F401 — early import for terminal detection
+    from textual_image.widget import Image as ImageWidget
+    HAS_TEXTUAL_IMAGE = True
+except ImportError:
+    HAS_TEXTUAL_IMAGE = False
+    ImageWidget = None
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -55,6 +63,7 @@ from textual.reactive import reactive
 from textual.worker import get_current_worker
 from textual.screen import Screen
 from textual.message import Message
+from textual.widget import Widget
 
 
 # -----------------------------
@@ -112,11 +121,7 @@ IMAGE_PREVIEW_EXTENSIONS = {
     ".webp",
 }
 PREVIEW_CACHE_DIR = Path(tempfile.gettempdir()) / "photo_dupe_preview_cache"
-PREVIEW_CHARS_WIDTH = 48
-PREVIEW_CHARS_HEIGHT = 14
-PREVIEW_BLOCK_CACHE_LIMIT = 128
 PREVIEW_CMD_TIMEOUT_SECONDS = 4.0
-PREVIEW_DEBOUNCE_SECONDS = 0.18
 PHOTO_CLUSTER_GAP_SECONDS = 2
 PROCESS_POOL_BROKEN = False
 PROCESS_POOL_BROKEN_REASON = ""
@@ -425,6 +430,57 @@ def read_exif_quick(path: Path) -> Tuple[Optional[int], Optional[str], Optional[
 
 
 # -----------------------------
+# Lazy EXIF loading (post-match)
+# -----------------------------
+
+_exif_cache: Dict[Path, Tuple] = {}
+
+
+def clear_exif_cache() -> None:
+    _exif_cache.clear()
+
+
+def load_exif_for_fileinfo(fi: FileInfo) -> FileInfo:
+    if fi.ext not in EXIF_CANDIDATE_EXTS:
+        return fi
+    if fi.path in _exif_cache:
+        exif_dt, camera_model, lens_model, width, height = _exif_cache[fi.path]
+    else:
+        exif_dt, camera_model, lens_model, width, height = read_exif_quick(fi.path)
+        _exif_cache[fi.path] = (exif_dt, camera_model, lens_model, width, height)
+    return FileInfo(
+        path=fi.path,
+        stem=fi.stem,
+        ext=fi.ext,
+        size=fi.size,
+        mtime=fi.mtime,
+        exif_dt=exif_dt,
+        camera_model=camera_model,
+        lens_model=lens_model,
+        width=width,
+        height=height,
+    )
+
+
+def load_exif_for_matches(matches: List[MatchRow]) -> List[MatchRow]:
+    out: List[MatchRow] = []
+    for m in matches:
+        new_sd = load_exif_for_fileinfo(m.sd)
+        new_drive = load_exif_for_fileinfo(m.drive)
+        if new_sd is m.sd and new_drive is m.drive:
+            out.append(m)
+        else:
+            out.append(MatchRow(
+                kind=m.kind,
+                sd=new_sd,
+                drive=new_drive,
+                format_type=m.format_type,
+                reason=m.reason,
+            ))
+    return out
+
+
+# -----------------------------
 # Scanning
 # -----------------------------
 
@@ -451,14 +507,6 @@ def scan_chunk_build_info(args: Tuple[List[Path]]) -> List[FileInfo]:
             ext = p.suffix.lower()
             stem = p.stem
 
-            exif_dt = None
-            camera_model = None
-            lens_model = None
-            width = None
-            height = None
-            if ext in EXIF_CANDIDATE_EXTS:
-                exif_dt, camera_model, lens_model, width, height = read_exif_quick(p)
-
             out.append(
                 FileInfo(
                     path=p,
@@ -466,11 +514,6 @@ def scan_chunk_build_info(args: Tuple[List[Path]]) -> List[FileInfo]:
                     ext=ext,
                     size=int(st.st_size),
                     mtime=float(st.st_mtime),
-                    exif_dt=exif_dt,
-                    camera_model=camera_model,
-                    lens_model=lens_model,
-                    width=width,
-                    height=height,
                 )
             )
         except Exception:
@@ -750,6 +793,86 @@ def find_matches_hybrid(
                         )
 
     return matches, sorted(cross_types)
+
+
+def build_drive_size_index(drive_infos: List[FileInfo]) -> Dict[int, List[FileInfo]]:
+    by_size: Dict[int, List[FileInfo]] = defaultdict(list)
+    for fi in drive_infos:
+        if fi.size > 0:
+            by_size[fi.size].append(fi)
+    return dict(by_size)
+
+
+def find_content_matches(
+    sd_infos: List[FileInfo],
+    drive_infos: List[FileInfo],
+    already_matched_sd_paths: set[Path],
+) -> List[MatchRow]:
+    drive_by_size = build_drive_size_index(drive_infos)
+    matches: List[MatchRow] = []
+    partial_cache: Dict[Path, Optional[str]] = {}
+    full_cache: Dict[Path, Optional[str]] = {}
+
+    def get_partial(path: Path) -> Optional[str]:
+        if path not in partial_cache:
+            partial_cache[path] = partial_hash_file(path)
+        return partial_cache[path]
+
+    def get_full(path: Path) -> Optional[str]:
+        if path not in full_cache:
+            full_cache[path] = full_hash_file(path)
+        return full_cache[path]
+
+    for sd in sd_infos:
+        if sd.path in already_matched_sd_paths:
+            continue
+        if sd.size == 0:
+            continue
+
+        candidates = drive_by_size.get(sd.size)
+        if not candidates:
+            continue
+
+        sd_partial = get_partial(sd.path)
+        if sd_partial is None:
+            continue
+
+        partial_hits = [drv for drv in candidates if get_partial(drv.path) == sd_partial]
+        if not partial_hits:
+            continue
+
+        if len(partial_hits) == 1:
+            matches.append(MatchRow(
+                kind="EXACT",
+                sd=sd,
+                drive=partial_hits[0],
+                format_type="",
+                reason="Content hash match (different filename)",
+            ))
+            continue
+
+        sd_full = get_full(sd.path)
+        if sd_full is None:
+            matches.append(MatchRow(
+                kind="EXACT",
+                sd=sd,
+                drive=partial_hits[0],
+                format_type="",
+                reason="Content hash match (different filename, hash unavailable)",
+            ))
+            continue
+
+        full_hits = [drv for drv in partial_hits if get_full(drv.path) == sd_full]
+        if full_hits:
+            matches.append(MatchRow(
+                kind="EXACT",
+                sd=sd,
+                drive=full_hits[0],
+                format_type="",
+                reason="Content hash match (different filename)",
+            ))
+
+    return matches
 
 
 # -----------------------------
@@ -1108,44 +1231,6 @@ def resolve_preview_image(path: Path) -> Tuple[Optional[Path], str]:
     return None, f"{msg}; {msg_rawpy}. install exiftool or rawpy+Pillow for RAW previews"
 
 
-def render_preview_ascii(path: Path, width: int = PREVIEW_CHARS_WIDTH, height: int = PREVIEW_CHARS_HEIGHT) -> Tuple[Optional[str], str]:
-    preview_path, source_note = resolve_preview_image(path)
-    if preview_path is None:
-        return None, source_note
-
-    exe = shutil.which("chafa")
-    if not exe:
-        return None, f"{source_note}; chafa unavailable"
-
-    attempts = [
-        [exe, "--size", f"{width}x{height}", "--symbols", "ascii", "--colors", "0", str(preview_path)],
-        [exe, "--size", f"{width}x{height}", str(preview_path)],
-    ]
-    last_err = ""
-
-    for cmd in attempts:
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=PREVIEW_CMD_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            last_err = "timeout"
-            continue
-        except Exception as e:
-            last_err = str(e)
-            continue
-
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout.rstrip(), source_note
-        last_err = (proc.stderr or "").strip() or f"exit {proc.returncode}"
-
-    return None, f"{source_note}; chafa failed ({last_err})"
-
-
 # -----------------------------
 # Textual App
 # -----------------------------
@@ -1175,7 +1260,11 @@ class PhotoDupeTUI(App):
     #matches_table { height: 1fr; }
     #detail_area { height: 2fr; min-height: 6; }
     #compare_panel { width: 1fr; height: 1fr; border: round $accent; padding: 1; overflow-y: auto; }
-    #preview_panel { width: 1fr; height: 1fr; border: round $accent; padding: 1; overflow-y: auto; }
+    #preview_panel { width: 1fr; height: 1fr; border: round $accent; padding: 0; overflow: hidden; }
+    .preview-placeholder { width: 1fr; height: 1fr; padding: 1; content-align: center middle; }
+    .preview-side { width: 1fr; height: 1fr; }
+    .preview-image { width: 1fr; height: 1fr; }
+    .preview-label { height: auto; text-align: center; }
 
     #formats_popup { height: auto; max-height: 10; display: none; }
     #formats_popup.visible { display: block; }
@@ -1187,7 +1276,6 @@ class PhotoDupeTUI(App):
         ("space", "toggle_selected_row", "Toggle"),
         ("ctrl+a", "select_all", "Sel all"),
         ("ctrl+n", "select_none", "Sel none"),
-        ("p", "render_preview", "Preview"),
         ("f", "toggle_formats", "Filters"),
         ("q", "quarantine", "Quarantine"),
         ("u", "undo_last_apply", "Undo"),
@@ -1202,11 +1290,6 @@ class PhotoDupeTUI(App):
     pending_confirm_until: float = 0.0
     recent_paths: Dict[str, List[str]] = {"drive": [], "sd": []}
     recent_events_suspended: bool = False
-    preview_generation: int = 0
-    preview_block_cache: OrderedDict[Tuple[str, int, int], str] = OrderedDict()
-    preview_inflight: bool = False
-    preview_pending: Optional[Tuple[MatchRow, int]] = None
-    preview_timer = None
     preview_focus_row: Optional[MatchRow] = None
     selected_match_keys: set[str] = set()
     cluster_by_match_key: Dict[str, str] = {}
@@ -1232,8 +1315,8 @@ class PhotoDupeTUI(App):
             with Horizontal(id="options_row"):
                 yield Static("Substring:")
                 yield Switch(value=True, id="substring_switch")
-                yield Static("Auto preview:")
-                yield Switch(value=False, id="auto_preview_switch")
+                yield Static("Content match:")
+                yield Switch(value=True, id="content_match_switch")
                 yield Button("Quarantine", id="quarantine_btn", variant="warning")
                 yield Button("Undo", id="undo_btn")
                 yield Button("View Q", id="view_quarantine_btn")
@@ -1251,7 +1334,8 @@ class PhotoDupeTUI(App):
                 yield DataTable(id="matches_table")
             with Horizontal(id="detail_area"):
                 yield Static("Select a match to compare.", id="compare_panel")
-                yield Static("Select a match to preview.", id="preview_panel")
+                with Horizontal(id="preview_panel"):
+                    yield Static("Select a match to preview.", classes="preview-placeholder")
 
         yield Footer()
 
@@ -1309,136 +1393,55 @@ class PhotoDupeTUI(App):
     def _set_compare(self, msg: str) -> None:
         self.query_one("#compare_panel", Static).update(msg)
 
-    def _set_preview(self, msg: str) -> None:
-        self.query_one("#preview_panel", Static).update(msg)
+    def _update_preview_images(self, row: Optional[MatchRow]) -> None:
+        panel = self.query_one("#preview_panel")
+        panel.remove_children()
+        image_widget_factory = cast(Callable[..., Widget], ImageWidget) if ImageWidget is not None else None
 
-    def _is_auto_preview_enabled(self) -> bool:
-        try:
-            return self.query_one("#auto_preview_switch", Switch).value
-        except Exception:
-            return False
-
-    def _stop_preview_timer(self) -> None:
-        if self.preview_timer is not None:
-            try:
-                self.preview_timer.stop()
-            except Exception:
-                pass
-            self.preview_timer = None
-
-    def _invalidate_preview_pipeline(self) -> None:
-        self.preview_generation += 1
-        self.preview_pending = None
-        self._stop_preview_timer()
-
-    def _preview_block_cache_key(self, path: Path) -> Tuple[str, int, int]:
-        try:
-            st = path.stat()
-            return str(path.resolve()), int(st.st_mtime), int(st.st_size)
-        except Exception:
-            return str(path), 0, 0
-
-    def _preview_block_from_cache(self, path: Path) -> Optional[str]:
-        key = self._preview_block_cache_key(path)
-        cached = self.preview_block_cache.get(key)
-        if cached is None:
-            return None
-        # Keep recency for bounded LRU behavior.
-        self.preview_block_cache.move_to_end(key)
-        return cached
-
-    def _remember_preview_block(self, path: Path, block: str) -> None:
-        key = self._preview_block_cache_key(path)
-        self.preview_block_cache[key] = block
-        self.preview_block_cache.move_to_end(key)
-        while len(self.preview_block_cache) > PREVIEW_BLOCK_CACHE_LIMIT:
-            self.preview_block_cache.popitem(last=False)
-
-    def _format_preview_block(self, label: str, path: Path) -> str:
-        cached = self._preview_block_from_cache(path)
-        if cached is not None:
-            return cached
-
-        art, source = render_preview_ascii(path)
-        if art:
-            block = "\n".join(
-                [
-                    f"{label}: {path.name}",
-                    art,
-                    f"Source: {source}",
-                ]
-            )
-        else:
-            block = "\n".join(
-                [
-                    f"{label}: {path.name}",
-                    f"Preview unavailable: {source}",
-                ]
-            )
-        self._remember_preview_block(path, block)
-        return block
-
-    def _format_preview_panel(self, row: MatchRow) -> str:
-        sd_block = self._format_preview_block("SD", row.sd.path)
-        drive_block = self._format_preview_block("Drive", row.drive.path)
-        return "\n\n".join([sd_block, drive_block])
-
-    def _update_preview_if_current(self, generation: int, text: str) -> None:
-        self.preview_inflight = False
-        if generation != self.preview_generation:
-            self._start_pending_preview()
-            return
-        self._set_preview(text)
-        self._start_pending_preview()
-
-    def _preview_worker(self, row: MatchRow, generation: int) -> None:
-        try:
-            rendered = self._format_preview_panel(row)
-        except Exception as e:
-            rendered = f"Preview unavailable: {e}"
-        self.call_from_thread(self._update_preview_if_current, generation, rendered)
-
-    def _schedule_preview_start(self) -> None:
-        self._stop_preview_timer()
-        self.preview_timer = self.set_timer(PREVIEW_DEBOUNCE_SECONDS, self._start_pending_preview)
-
-    def _start_pending_preview(self) -> None:
-        self.preview_timer = None
-        if self.preview_inflight:
-            return
-        if self.preview_pending is None:
+        if row is None or not HAS_TEXTUAL_IMAGE or image_widget_factory is None:
+            msg = "Select a match to preview."
+            if row is not None:
+                msg = "textual-image not available. Install with: pip install textual-image[textual]"
+            panel.mount(Static(msg, classes="preview-placeholder"))
             return
 
-        row, generation = self.preview_pending
-        self.preview_pending = None
-        self.preview_inflight = True
+        panel.mount(Static("Loading previews\u2026", classes="preview-placeholder"))
+
+        captured_row = row
+
+        def do_preview(image_widget_factory: Callable[..., Widget] = image_widget_factory) -> None:
+            sd_img, sd_note = resolve_preview_image(captured_row.sd.path)
+            drv_img, drv_note = resolve_preview_image(captured_row.drive.path)
+
+            def mount_images() -> None:
+                panel.remove_children()
+
+                sd_container = Vertical(classes="preview-side")
+                drv_container = Vertical(classes="preview-side")
+                panel.mount(sd_container)
+                panel.mount(drv_container)
+
+                sd_container.mount(Static(f"SD: {captured_row.sd.path.name}", classes="preview-label"))
+                if sd_img is not None:
+                    sd_container.mount(image_widget_factory(sd_img, classes="preview-image"))
+                else:
+                    sd_container.mount(Static(f"No preview: {sd_note}", classes="preview-image"))
+
+                drv_container.mount(Static(f"Drive: {captured_row.drive.path.name}", classes="preview-label"))
+                if drv_img is not None:
+                    drv_container.mount(image_widget_factory(drv_img, classes="preview-image"))
+                else:
+                    drv_container.mount(Static(f"No preview: {drv_note}", classes="preview-image"))
+
+            self.call_from_thread(mount_images)
+
         self.run_worker(
-            lambda: self._preview_worker(row, generation),
+            do_preview,
             group="preview",
-            exclusive=False,
-            name=f"preview_worker_{generation}",
+            exclusive=True,
+            name="preview_worker",
             thread=True,
         )
-
-    def _request_preview_render(self, row: Optional[MatchRow], *, force: bool = False) -> None:
-        if row is None:
-            self.preview_generation += 1
-            self.preview_pending = None
-            self._stop_preview_timer()
-            self._set_preview("Select a match to render previews.")
-            return
-
-        if not force and not self._is_auto_preview_enabled():
-            # Don't touch the preview pipeline — a manual render may be
-            # in-flight or pending, and bumping the generation / clearing
-            # the pending state here would silently cancel it.
-            return
-
-        self.preview_generation += 1
-        generation = self.preview_generation
-        self.preview_pending = (row, generation)
-        self._set_preview("Rendering previews…")
-        self._schedule_preview_start()
 
     def _refresh_recent_select(self, key: str) -> None:
         select_id = "#drive_recent_select" if key == "drive" else "#sd_recent_select"
@@ -1604,6 +1607,13 @@ class PhotoDupeTUI(App):
             self._set_selected(m, False)
         return len(filtered)
 
+    @property
+    def _content_match_enabled(self) -> bool:
+        try:
+            return self.query_one("#content_match_switch", Switch).value
+        except Exception:
+            return True
+
     def _read_inputs(self) -> Tuple[Optional[Path], Optional[Path], str, bool]:
         drive = self.query_one("#drive_input", Input).value.strip()
         sd = self.query_one("#sd_input", Input).value.strip()
@@ -1679,7 +1689,7 @@ class PhotoDupeTUI(App):
             focus = filtered[0] if filtered else None
         self.preview_focus_row = focus
         self._set_compare(self._format_compare_panel(focus))
-        self._request_preview_render(focus)
+        self._update_preview_images(focus)
 
     # -----------------
     # Actions
@@ -1743,8 +1753,6 @@ class PhotoDupeTUI(App):
 
     def action_clear(self) -> None:
         self._clear_pending_confirmation()
-        self._invalidate_preview_pipeline()
-        self.preview_inflight = False
         self.all_matches = []
         self.cross_types = []
         self.enabled_cross_types = set()
@@ -1756,7 +1764,7 @@ class PhotoDupeTUI(App):
         self.query_one("#formats_list", SelectionList).clear_options()
         self.query_one("#matches_table", DataTable).clear()
         self._set_compare("Select a match to compare.")
-        self._request_preview_render(None)
+        self._update_preview_images(None)
         self._set_status("Cleared. Pick folders and Scan.")
 
     def action_scan(self) -> None:
@@ -1801,8 +1809,8 @@ class PhotoDupeTUI(App):
     def _scan_worker(self, drive_path: Path, sd_path: Path, substring: bool) -> None:
         worker = get_current_worker()
 
-        # Phase weights: drive scan 45%, SD scan 45%, matching 10%
-        phase_offset = 0.0
+        # Phase weights: drive 40%, SD 40%, name match 8%, content match 7%, EXIF 5%
+        clear_exif_cache()
 
         def emit(msg: str) -> None:
             if worker.is_cancelled:
@@ -1823,7 +1831,7 @@ class PhotoDupeTUI(App):
         drive_infos = scan_directory_parallel_infos(
             drive_path, "files on drive",
             emit_progress=emit,
-            progress_callback=make_chunk_cb(0.0, 0.45),
+            progress_callback=make_chunk_cb(0.0, 0.40),
         )
         if worker.is_cancelled:
             return
@@ -1832,7 +1840,7 @@ class PhotoDupeTUI(App):
         sd_infos = scan_directory_parallel_infos(
             sd_path, "files on SD card",
             emit_progress=emit,
-            progress_callback=make_chunk_cb(0.45, 0.45),
+            progress_callback=make_chunk_cb(0.40, 0.40),
         )
         if worker.is_cancelled:
             return
@@ -1846,14 +1854,39 @@ class PhotoDupeTUI(App):
             self.call_from_thread(self._set_progress_visible, False)
             return
 
-        emit("Matching (HYBRID)…")
-        self.call_from_thread(self._show_progress, 90)
+        emit("Matching (name-based)…")
+        self.call_from_thread(self._show_progress, 80)
         matches, cross_types = find_matches_hybrid(
             sd_infos,
             drive_infos,
             enable_substring_fallback=substring,
             exif_tolerance_seconds=0,
         )
+
+        if worker.is_cancelled:
+            return
+
+        # Content-based matching for unmatched SD files
+        content_match_enabled = self._content_match_enabled
+        if content_match_enabled:
+            emit("Matching (content-based)…")
+            self.call_from_thread(self._show_progress, 88)
+            matched_sd_paths = {m.sd.path for m in matches}
+            content_matches = find_content_matches(sd_infos, drive_infos, matched_sd_paths)
+            matches.extend(content_matches)
+            cross_types_set = set(cross_types)
+            for cm in content_matches:
+                if cm.format_type:
+                    cross_types_set.add(cm.format_type)
+            cross_types = sorted(cross_types_set)
+
+        if worker.is_cancelled:
+            return
+
+        # Load EXIF for matched files only (much faster than scanning all)
+        emit("Loading EXIF metadata for matches…")
+        self.call_from_thread(self._show_progress, 95)
+        matches = load_exif_for_matches(matches)
 
         def done() -> None:
             self._show_progress(100)
@@ -1896,7 +1929,7 @@ class PhotoDupeTUI(App):
         row = self._match_from_row_key(event.row_key)
         self.preview_focus_row = row
         self._set_compare(self._format_compare_panel(row))
-        self._request_preview_render(row)
+        self._update_preview_images(row)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "matches_table":
@@ -1906,21 +1939,6 @@ class PhotoDupeTUI(App):
             return
         self._set_selected(row, not self._is_selected(row))
         self._refresh_matches_table()
-
-    def on_switch_changed(self, event: Switch.Changed) -> None:
-        sid = event.switch.id
-        if sid != "auto_preview_switch":
-            return
-
-        if event.value:
-            self._set_status("Auto-preview enabled.")
-            self._request_preview_render(self.preview_focus_row)
-            return
-
-        self._invalidate_preview_pipeline()
-        self.preview_inflight = False
-        self._set_preview("Auto-preview is off. Press 'Render preview' for the selected row.")
-        self._set_status("Auto-preview disabled.")
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if self.recent_events_suspended:
@@ -1952,17 +1970,6 @@ class PhotoDupeTUI(App):
 
     def action_toggle_formats(self) -> None:
         self.query_one("#formats_popup").toggle_class("visible")
-
-    def action_render_preview(self) -> None:
-        row = self.preview_focus_row
-        if row is None:
-            filtered = self._current_filtered_matches()
-            row = filtered[0] if filtered else None
-            self.preview_focus_row = row
-        if row is None:
-            self._set_preview("No match selected. Scan and highlight a row first.")
-            return
-        self._request_preview_render(row, force=True)
 
     def action_select_all(self) -> None:
         count = self._select_all_filtered()

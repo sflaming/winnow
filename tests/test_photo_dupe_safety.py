@@ -5,9 +5,12 @@ from unittest.mock import patch
 
 from photo_dupe import (
     FileInfo,
+    clear_exif_cache,
+    find_content_matches,
     find_last_pending_tx,
     find_matches_hybrid,
     full_hash_file,
+    load_exif_for_fileinfo,
     load_recent_paths,
     partial_hash_file,
     paths_overlap,
@@ -240,6 +243,73 @@ class SafetyRulesTests(unittest.TestCase):
             remember_recent_path(recent, "sd", Path(f"/p{i}"), limit=5)
         self.assertEqual(len(recent["sd"]), 5)
         self.assertEqual(recent["sd"][0], "/p19")
+
+    def test_scan_chunk_does_not_read_exif(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jpg = root / "IMG_0001.jpg"
+            jpg.write_bytes(b"fake-jpeg-data")
+
+            infos = scan_chunk_build_info(([jpg],))
+            self.assertEqual(len(infos), 1)
+            fi = infos[0]
+            self.assertIsNone(fi.exif_dt)
+            self.assertIsNone(fi.camera_model)
+            self.assertIsNone(fi.lens_model)
+            self.assertIsNone(fi.width)
+            self.assertIsNone(fi.height)
+
+    def test_content_match_finds_renamed_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sd_file = root / "sd" / "IMG_0001.jpg"
+            drv_file = root / "drive" / "RENAMED.jpg"
+            sd_file.parent.mkdir(parents=True)
+            drv_file.parent.mkdir(parents=True)
+            content = b"identical-content-" * 100
+            sd_file.write_bytes(content)
+            drv_file.write_bytes(content)
+
+            sd_fi = FileInfo(path=sd_file, stem="IMG_0001", ext=".jpg", size=len(content), mtime=0.0)
+            drv_fi = FileInfo(path=drv_file, stem="RENAMED", ext=".jpg", size=len(content), mtime=0.0)
+
+            matches = find_content_matches([sd_fi], [drv_fi], set())
+            self.assertEqual(len(matches), 1)
+            self.assertIn("Content hash match", matches[0].reason)
+
+    def test_content_match_skips_already_matched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sd_file = root / "sd" / "IMG_0001.jpg"
+            drv_file = root / "drive" / "RENAMED.jpg"
+            sd_file.parent.mkdir(parents=True)
+            drv_file.parent.mkdir(parents=True)
+            content = b"identical-content-" * 100
+            sd_file.write_bytes(content)
+            drv_file.write_bytes(content)
+
+            sd_fi = FileInfo(path=sd_file, stem="IMG_0001", ext=".jpg", size=len(content), mtime=0.0)
+            drv_fi = FileInfo(path=drv_file, stem="RENAMED", ext=".jpg", size=len(content), mtime=0.0)
+
+            matches = find_content_matches([sd_fi], [drv_fi], {sd_file})
+            self.assertEqual(len(matches), 0)
+
+    def test_content_match_different_content_no_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sd_file = root / "sd" / "IMG_0001.jpg"
+            drv_file = root / "drive" / "OTHER.jpg"
+            sd_file.parent.mkdir(parents=True)
+            drv_file.parent.mkdir(parents=True)
+            # Same size but different content
+            sd_file.write_bytes(b"a" * 2000)
+            drv_file.write_bytes(b"b" * 2000)
+
+            sd_fi = FileInfo(path=sd_file, stem="IMG_0001", ext=".jpg", size=2000, mtime=0.0)
+            drv_fi = FileInfo(path=drv_file, stem="OTHER", ext=".jpg", size=2000, mtime=0.0)
+
+            matches = find_content_matches([sd_fi], [drv_fi], set())
+            self.assertEqual(len(matches), 0)
 
 
 if __name__ == "__main__":

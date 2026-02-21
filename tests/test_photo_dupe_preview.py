@@ -1,12 +1,13 @@
 import tempfile
 import unittest
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 from photo_dupe import (
+    FileInfo,
     _preview_cache_path_for,
-    render_preview_ascii,
+    clear_exif_cache,
+    load_exif_for_fileinfo,
     resolve_preview_image,
 )
 
@@ -52,33 +53,47 @@ class PreviewHelpersTests(unittest.TestCase):
             self.assertIsNone(preview)
             self.assertIn("install exiftool or rawpy+Pillow", note)
 
-    def test_render_preview_ascii_reports_missing_chafa(self) -> None:
+    def test_load_exif_for_fileinfo_populates_exif_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jpg = Path(tmp) / "img.jpg"
-            jpg.write_bytes(b"jpg")
+            jpg.write_bytes(b"fake-jpg")
 
-            def fake_which(name: str):
-                if name == "chafa":
-                    return None
-                return "/usr/bin/exiftool"
+            fi = FileInfo(path=jpg, stem="img", ext=".jpg", size=8, mtime=0.0)
+            clear_exif_cache()
 
-            with patch("photo_dupe.shutil.which", side_effect=fake_which):
-                art, note = render_preview_ascii(jpg)
+            with patch("photo_dupe.read_exif_quick", return_value=(1700000000, "Canon EOS R5", "RF 50mm", 6000, 4000)):
+                result = load_exif_for_fileinfo(fi)
 
-            self.assertIsNone(art)
-            self.assertIn("chafa unavailable", note)
+            self.assertEqual(result.exif_dt, 1700000000)
+            self.assertEqual(result.camera_model, "Canon EOS R5")
+            self.assertEqual(result.lens_model, "RF 50mm")
+            self.assertEqual(result.width, 6000)
+            self.assertEqual(result.height, 4000)
 
-    def test_render_preview_ascii_reports_chafa_timeout(self) -> None:
+    def test_load_exif_for_fileinfo_skips_non_exif_ext(self) -> None:
+        fi = FileInfo(path=Path("/fake/img.png"), stem="img", ext=".png", size=100, mtime=0.0)
+        clear_exif_cache()
+        result = load_exif_for_fileinfo(fi)
+        self.assertIs(result, fi)
+        self.assertIsNone(result.exif_dt)
+
+    def test_clear_exif_cache_clears(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jpg = Path(tmp) / "img.jpg"
-            jpg.write_bytes(b"jpg")
+            jpg.write_bytes(b"fake")
 
-            with patch("photo_dupe.shutil.which", side_effect=lambda name: "/usr/bin/chafa" if name == "chafa" else None):
-                with patch("photo_dupe.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["chafa"], timeout=1)):
-                    art, note = render_preview_ascii(jpg)
+            fi = FileInfo(path=jpg, stem="img", ext=".jpg", size=4, mtime=0.0)
+            clear_exif_cache()
 
-            self.assertIsNone(art)
-            self.assertIn("timeout", note)
+            with patch("photo_dupe.read_exif_quick", return_value=(100, None, None, None, None)):
+                r1 = load_exif_for_fileinfo(fi)
+            self.assertEqual(r1.exif_dt, 100)
+
+            clear_exif_cache()
+
+            with patch("photo_dupe.read_exif_quick", return_value=(200, None, None, None, None)):
+                r2 = load_exif_for_fileinfo(fi)
+            self.assertEqual(r2.exif_dt, 200)
 
 
 if __name__ == "__main__":

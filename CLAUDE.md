@@ -22,11 +22,11 @@ uv run python -m pytest tests/test_photo_dupe_safety.py
 uv run python -m pytest tests/test_photo_dupe_safety.py::SafetyRulesTests::test_paths_overlap_detects_same_and_nested
 ```
 
-Uses `uv` for dependency management (Python 3.13). Dependencies: `textual`, `exifread`, `textual-image`.
+Uses `uv` for dependency management (Python >=3.11). Dependencies: `textual`, `exifread`, `textual-image`, `pillow`, `rawpy`.
 
 ## Architecture
 
-Everything lives in a single file: `photo_dupe.py`. Key sections in order:
+Everything lives in a single file: `photo_dupe.py` (~2200 lines). Key sections in order:
 
 1. **Config constants** — extension sets (BLACKLIST, EXIF, RAW, IMAGE preview), hash parameters, quarantine/transaction log names
 2. **Data models** — `FileInfo` (frozen dataclass per file with EXIF metadata) and `MatchRow` (a paired SD↔Drive match with kind/reason)
@@ -38,6 +38,14 @@ Everything lives in a single file: `photo_dupe.py`. Key sections in order:
 8. **Safety** — quarantine moves files to `.photo_dupe_quarantine/` with a JSONL transaction log (`.photo_dupe_transactions.jsonl`), enabling undo. Destructive actions require a second button press within a confirmation window.
 9. **Preview pipeline** — resolves preview images (direct for JPG/PNG, exiftool/rawpy extraction for RAW), renders side-by-side via `textual-image` widgets (sixel/iTerm2/kitty with auto-fallback).
 10. **TUI (`PhotoDupeTUI`)** — the main Textual `App`. Three-column layout: left (cross-format filters + selection controls), middle (matches DataTable + compare panel), right (side-by-side image preview panel). Workers run on background threads via `run_worker(thread=True)` and post back with `call_from_thread`.
+
+## Tests
+
+Two test files in `tests/`, both using `unittest`:
+- `test_photo_dupe_safety.py` — core logic: matching, hashing, scanning, path safety, quarantine transactions, recent paths
+- `test_photo_dupe_preview.py` — preview pipeline: cache path stability, exiftool/rawpy extraction, fallback behavior
+
+Tests import directly from `photo_dupe` (no package install needed). Use `tempfile.TemporaryDirectory` for isolation and `unittest.mock.patch` for subprocess/platform mocking.
 
 ## Key Design Decisions
 

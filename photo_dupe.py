@@ -155,7 +155,7 @@ class MatchRow:
     kind: str                   # "EXACT" or "CROSS"
     sd: FileInfo
     drive: FileInfo
-    format_type: str            # ".raf -> .jpg" or "" for exact
+    format_type: str            # ".raf -> .jpg" cross or ".jpg" same-format
     reason: str                 # why it matched
 
 
@@ -486,7 +486,10 @@ def load_exif_for_matches(matches: List[MatchRow]) -> List[MatchRow]:
 
 def collect_all_files(directory: Path) -> List[Path]:
     all_files: List[Path] = []
-    for root, _, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        # Skip quarantine and transaction-log directories in-place so
+        # os.walk won't descend into them on subsequent iterations.
+        dirs[:] = [d for d in dirs if d != QUARANTINE_DIR_NAME]
         root_path = Path(root)
         for name in files:
             if name.startswith("."):
@@ -697,7 +700,7 @@ def find_matches_hybrid(
             drive_by_ext_for_sub[fi.ext].append((fi.stem, fi))
 
     matches: List[MatchRow] = []
-    cross_types: set[str] = set()
+    format_types: set[str] = set()
     partial_cache: Dict[Path, Optional[str]] = {}
     full_cache: Dict[Path, Optional[str]] = {}
 
@@ -743,12 +746,13 @@ def find_matches_hybrid(
         drv_exact, exact_reason = choose_exact_candidate(sd, exact_same_size)
         has_primary_exact = drv_exact is not None
         if drv_exact:
+            format_types.add(sd.ext)
             matches.append(
                 MatchRow(
                     kind="EXACT",
                     sd=sd,
                     drive=drv_exact,
-                    format_type="",
+                    format_type=sd.ext,
                     reason=exact_reason,
                 )
             )
@@ -761,12 +765,13 @@ def find_matches_hybrid(
             # exact-ext substring
             for drive_stem, drv in drive_by_ext_for_sub.get(sd_ext, []):
                 if sd_stem in drive_stem:
+                    format_types.add(sd_ext)
                     matches.append(
                         MatchRow(
                             kind="EXACT",
                             sd=sd,
                             drive=drv,
-                            format_type="",
+                            format_type=sd_ext,
                             reason="Substring stem match (legacy)",
                         )
                     )
@@ -781,7 +786,7 @@ def find_matches_hybrid(
                 for drive_stem, drv in items:
                     if sd_stem in drive_stem:
                         fmt = f"{sd_ext} -> {other_ext}"
-                        cross_types.add(fmt)
+                        format_types.add(fmt)
                         matches.append(
                             MatchRow(
                                 kind="CROSS",
@@ -792,7 +797,7 @@ def find_matches_hybrid(
                             )
                         )
 
-    return matches, sorted(cross_types)
+    return matches, sorted(format_types)
 
 
 def build_drive_size_index(drive_infos: List[FileInfo]) -> Dict[int, List[FileInfo]]:
@@ -842,33 +847,39 @@ def find_content_matches(
             continue
 
         if len(partial_hits) == 1:
+            drv = partial_hits[0]
+            fmt = sd.ext if sd.ext == drv.ext else f"{sd.ext} -> {drv.ext}"
             matches.append(MatchRow(
                 kind="EXACT",
                 sd=sd,
-                drive=partial_hits[0],
-                format_type="",
+                drive=drv,
+                format_type=fmt,
                 reason="Content hash match (different filename)",
             ))
             continue
 
         sd_full = get_full(sd.path)
         if sd_full is None:
+            drv = partial_hits[0]
+            fmt = sd.ext if sd.ext == drv.ext else f"{sd.ext} -> {drv.ext}"
             matches.append(MatchRow(
                 kind="EXACT",
                 sd=sd,
-                drive=partial_hits[0],
-                format_type="",
+                drive=drv,
+                format_type=fmt,
                 reason="Content hash match (different filename, hash unavailable)",
             ))
             continue
 
         full_hits = [drv for drv in partial_hits if get_full(drv.path) == sd_full]
         if full_hits:
+            drv = full_hits[0]
+            fmt = sd.ext if sd.ext == drv.ext else f"{sd.ext} -> {drv.ext}"
             matches.append(MatchRow(
                 kind="EXACT",
                 sd=sd,
-                drive=full_hits[0],
-                format_type="",
+                drive=drv,
+                format_type=fmt,
                 reason="Content hash match (different filename)",
             ))
 
@@ -1249,6 +1260,7 @@ class PhotoDupeTUI(App):
     #paths_row #btn_col { width: auto; min-width: 18; }
     #paths_row #btn_col Button { width: 100%; }
     #options_row { height: auto; margin-top: 1; }
+    #prefix_input { width: 16; }
     #options_row Button { width: auto; min-width: 10; }
     #options_row Static { width: auto; padding: 0 1 0 0; }
     #status { height: auto; }
@@ -1277,14 +1289,15 @@ class PhotoDupeTUI(App):
         ("ctrl+a", "select_all", "Sel all"),
         ("ctrl+n", "select_none", "Sel none"),
         ("f", "toggle_formats", "Filters"),
+        ("r", "apply_rename", "Rename"),
         ("q", "quarantine", "Quarantine"),
         ("u", "undo_last_apply", "Undo"),
         ("c", "clear", "Clear"),
     ]
 
     all_matches: List[MatchRow] = []
-    cross_types: List[str] = []
-    enabled_cross_types: set[str] = set()
+    format_types: List[str] = []
+    enabled_format_types: set[str] = set()
     last_sd_root: Optional[Path] = None
     pending_confirm_action: Optional[str] = None
     pending_confirm_until: float = 0.0
@@ -1293,8 +1306,6 @@ class PhotoDupeTUI(App):
     preview_focus_row: Optional[MatchRow] = None
     selected_match_keys: set[str] = set()
     cluster_by_match_key: Dict[str, str] = {}
-    rename_prefix: str = "COPIED_"
-
     def compose(self) -> ComposeResult:
         yield Header()
 
@@ -1317,6 +1328,9 @@ class PhotoDupeTUI(App):
                 yield Switch(value=True, id="substring_switch")
                 yield Static("Content match:")
                 yield Switch(value=True, id="content_match_switch")
+                yield Static("Prefix:")
+                yield Input(value="COPIED_", id="prefix_input")
+                yield Button("Rename", id="rename_btn", variant="success")
                 yield Button("Quarantine", id="quarantine_btn", variant="warning")
                 yield Button("Undo", id="undo_btn")
                 yield Button("View Q", id="view_quarantine_btn")
@@ -1328,7 +1342,7 @@ class PhotoDupeTUI(App):
 
         with Vertical(id="main"):
             with Vertical(id="formats_popup"):
-                yield Static("Cross-format filters:")
+                yield Static("Format filters:")
                 yield SelectionList(id="formats_list")
             with Vertical(id="table_area"):
                 yield DataTable(id="matches_table")
@@ -1361,6 +1375,8 @@ class PhotoDupeTUI(App):
         bid = event.button.id
         if bid == "scan_btn":
             self.action_scan()
+        elif bid == "rename_btn":
+            self.action_apply_rename()
         elif bid == "quarantine_btn":
             self.action_quarantine()
         elif bid == "undo_btn":
@@ -1410,10 +1426,19 @@ class PhotoDupeTUI(App):
         captured_row = row
 
         def do_preview(image_widget_factory: Callable[..., Widget] = image_widget_factory) -> None:
-            sd_img, sd_note = resolve_preview_image(captured_row.sd.path)
-            drv_img, drv_note = resolve_preview_image(captured_row.drive.path)
+            try:
+                sd_img, sd_note = resolve_preview_image(captured_row.sd.path)
+                drv_img, drv_note = resolve_preview_image(captured_row.drive.path)
+            except FileNotFoundError:
+                return
 
             def mount_images() -> None:
+                # File may have been quarantined/renamed between resolve and mount.
+                if sd_img is not None and not sd_img.exists():
+                    return
+                if drv_img is not None and not drv_img.exists():
+                    return
+
                 panel.remove_children()
 
                 sd_container = Vertical(classes="preview-side")
@@ -1617,7 +1642,7 @@ class PhotoDupeTUI(App):
     def _read_inputs(self) -> Tuple[Optional[Path], Optional[Path], str, bool]:
         drive = self.query_one("#drive_input", Input).value.strip()
         sd = self.query_one("#sd_input", Input).value.strip()
-        prefix = self.rename_prefix
+        prefix = self.query_one("#prefix_input", Input).value.strip()
 
         substring = self.query_one("#substring_switch", Switch).value
 
@@ -1629,22 +1654,19 @@ class PhotoDupeTUI(App):
     def _refresh_formats_list(self) -> None:
         sl = self.query_one("#formats_list", SelectionList)
         sl.clear_options()
-        if not self.cross_types:
+        if not self.format_types:
             return
 
-        if not self.enabled_cross_types:
-            self.enabled_cross_types = set(self.cross_types)
+        if not self.enabled_format_types:
+            self.enabled_format_types = set(self.format_types)
 
-        sl.add_options([(fmt, fmt, (fmt in self.enabled_cross_types)) for fmt in self.cross_types])
+        sl.add_options([(fmt, fmt, (fmt in self.enabled_format_types)) for fmt in self.format_types])
 
     def _current_filtered_matches(self) -> List[MatchRow]:
         out: List[MatchRow] = []
         for m in self.all_matches:
-            if m.kind == "EXACT":
+            if m.format_type in self.enabled_format_types:
                 out.append(m)
-            else:
-                if m.format_type in self.enabled_cross_types:
-                    out.append(m)
         return out
 
     def _refresh_matches_table(self) -> None:
@@ -1679,8 +1701,8 @@ class PhotoDupeTUI(App):
         self._set_status(
             f"Showing {len(filtered)} matches — Exact: {exact_n} | Cross: {cross_n} | "
             f"Unique SD files: {unique_sd} | Selected rows: {selected_rows} "
-            f"(unique SD {selected_unique_sd}) | Clusters: {len(visible_clusters)} | Conversions enabled: "
-            f"{len(self.enabled_cross_types)}/{len(self.cross_types)}"
+            f"(unique SD {selected_unique_sd}) | Clusters: {len(visible_clusters)} | Formats enabled: "
+            f"{len(self.enabled_format_types)}/{len(self.format_types)}"
         )
         focus = None
         if focus_key is not None:
@@ -1754,8 +1776,8 @@ class PhotoDupeTUI(App):
     def action_clear(self) -> None:
         self._clear_pending_confirmation()
         self.all_matches = []
-        self.cross_types = []
-        self.enabled_cross_types = set()
+        self.format_types = []
+        self.enabled_format_types = set()
         self.selected_match_keys.clear()
         self.cluster_by_match_key = {}
         self.last_sd_root = None
@@ -1856,7 +1878,7 @@ class PhotoDupeTUI(App):
 
         emit("Matching (name-based)…")
         self.call_from_thread(self._show_progress, 80)
-        matches, cross_types = find_matches_hybrid(
+        matches, format_types = find_matches_hybrid(
             sd_infos,
             drive_infos,
             enable_substring_fallback=substring,
@@ -1874,11 +1896,11 @@ class PhotoDupeTUI(App):
             matched_sd_paths = {m.sd.path for m in matches}
             content_matches = find_content_matches(sd_infos, drive_infos, matched_sd_paths)
             matches.extend(content_matches)
-            cross_types_set = set(cross_types)
+            format_types_set = set(format_types)
             for cm in content_matches:
                 if cm.format_type:
-                    cross_types_set.add(cm.format_type)
-            cross_types = sorted(cross_types_set)
+                    format_types_set.add(cm.format_type)
+            format_types = sorted(format_types_set)
 
         if worker.is_cancelled:
             return
@@ -1891,8 +1913,8 @@ class PhotoDupeTUI(App):
         def done() -> None:
             self._show_progress(100)
             self.all_matches = matches
-            self.cross_types = cross_types
-            self.enabled_cross_types = set(cross_types)
+            self.format_types = format_types
+            self.enabled_format_types = set(format_types)
             self.selected_match_keys = {self._match_key(m) for m in matches}
             self._rebuild_clusters()
             self._refresh_formats_list()
@@ -1920,7 +1942,7 @@ class PhotoDupeTUI(App):
         sl = self.query_one("#formats_list", SelectionList)
         if sl.option_count == 0:
             return
-        self.enabled_cross_types = {str(value) for value in sl.selected}
+        self.enabled_format_types = {str(value) for value in sl.selected}
         self._refresh_matches_table()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -2038,6 +2060,7 @@ class PhotoDupeTUI(App):
         moved = 0
         skipped = 0
         errors = 0
+        moved_sd_paths: set[Path] = set()
 
         for i, sd_file in enumerate(sd_unique, 1):
             if worker.is_cancelled:
@@ -2045,6 +2068,7 @@ class PhotoDupeTUI(App):
             success, msg, dst = move_to_quarantine(sd_file, sd_root, quarantine_root)
             if success and dst is not None:
                 moved += 1
+                moved_sd_paths.add(sd_file)
                 append_jsonl_record(
                     tx_log,
                     {
@@ -2062,11 +2086,23 @@ class PhotoDupeTUI(App):
                     errors += 1
             self.call_from_thread(self._set_status, f"{msg} ({i}/{total})")
 
-        self.call_from_thread(
-            self._set_status,
+        status = (
             f"Quarantine complete. Moved {moved}/{total}. Skipped {skipped}. Errors {errors}. "
-            f"Transaction: {tx_id}",
+            f"Transaction: {tx_id}"
         )
+
+        def finish_quarantine() -> None:
+            if moved_sd_paths:
+                self.all_matches = [
+                    m for m in self.all_matches if m.sd.path not in moved_sd_paths
+                ]
+                remaining_keys = {self._match_key(m) for m in self.all_matches}
+                self.selected_match_keys &= remaining_keys
+                self._rebuild_clusters()
+                self._refresh_matches_table()
+            self._set_status(status)
+
+        self.call_from_thread(finish_quarantine)
 
     def action_undo_last_apply(self) -> None:
         sd_root = self._get_sd_root_from_input() or self.last_sd_root
@@ -2154,7 +2190,7 @@ class PhotoDupeTUI(App):
             self._set_status("No matches loaded. Scan first.")
             return
 
-        prefix = self.rename_prefix
+        prefix = self.query_one("#prefix_input", Input).value.strip()
         prefix_err = validate_prefix(prefix)
         if prefix_err:
             self._set_status(prefix_err)

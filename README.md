@@ -25,7 +25,7 @@ Optional, improves RAW preview quality:
 
 ```bash
 # Run the app
-uv run python photo_dupe.py
+uv run python winnow.py
 ```
 
 Point it at your **destination drive** (where photos already live) and your **SD card / source folder**. Winnow scans both, presents the matches, and lets you review and quarantine the copies that are safely backed up.
@@ -37,7 +37,7 @@ Point it at your **destination drive** (where photos already live) and your **SD
 uv run python -m pytest tests/
 
 # A single test file
-uv run python -m pytest tests/test_photo_dupe_safety.py
+uv run python -m pytest tests/test_winnow_safety.py
 ```
 
-The application lives in a single module, `photo_dupe.py`. See `CLAUDE.md` for an architecture overview and `PREVIEW.md` for details on the preview pipeline.
+The application lives in a single module, `winnow.py`. See `CLAUDE.md` for an architecture overview and `PREVIEW.md` for details on the preview pipeline.

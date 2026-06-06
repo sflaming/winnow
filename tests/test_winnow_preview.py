@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from photo_dupe import (
+from winnow import (
     FileInfo,
     _preview_cache_path_for,
     clear_exif_cache,
@@ -32,8 +32,8 @@ class PreviewHelpersTests(unittest.TestCase):
                 stdout = b"jpeg-bytes"
                 stderr = b""
 
-            with patch("photo_dupe.shutil.which", side_effect=lambda name: "/usr/bin/exiftool" if name == "exiftool" else None):
-                with patch("photo_dupe.subprocess.run", return_value=Proc()):
+            with patch("winnow.shutil.which", side_effect=lambda name: "/usr/bin/exiftool" if name == "exiftool" else None):
+                with patch("winnow.subprocess.run", return_value=Proc()):
                     preview, note = resolve_preview_image(raw)
 
             self.assertIsNotNone(preview)
@@ -47,7 +47,7 @@ class PreviewHelpersTests(unittest.TestCase):
             raw = Path(tmp) / "img.raf"
             raw.write_bytes(b"raw")
 
-            with patch("photo_dupe.shutil.which", return_value=None):
+            with patch("winnow.shutil.which", return_value=None):
                 preview, note = resolve_preview_image(raw)
 
             self.assertIsNone(preview)
@@ -61,7 +61,7 @@ class PreviewHelpersTests(unittest.TestCase):
             fi = FileInfo(path=jpg, stem="img", ext=".jpg", size=8, mtime=0.0)
             clear_exif_cache()
 
-            with patch("photo_dupe.read_exif_quick", return_value=(1700000000, "Canon EOS R5", "RF 50mm", 6000, 4000)):
+            with patch("winnow.read_exif_quick", return_value=(1700000000, "Canon EOS R5", "RF 50mm", 6000, 4000)):
                 result = load_exif_for_fileinfo(fi)
 
             self.assertEqual(result.exif_dt, 1700000000)
@@ -85,13 +85,13 @@ class PreviewHelpersTests(unittest.TestCase):
             fi = FileInfo(path=jpg, stem="img", ext=".jpg", size=4, mtime=0.0)
             clear_exif_cache()
 
-            with patch("photo_dupe.read_exif_quick", return_value=(100, None, None, None, None)):
+            with patch("winnow.read_exif_quick", return_value=(100, None, None, None, None)):
                 r1 = load_exif_for_fileinfo(fi)
             self.assertEqual(r1.exif_dt, 100)
 
             clear_exif_cache()
 
-            with patch("photo_dupe.read_exif_quick", return_value=(200, None, None, None, None)):
+            with patch("winnow.read_exif_quick", return_value=(200, None, None, None, None)):
                 r2 = load_exif_for_fileinfo(fi)
             self.assertEqual(r2.exif_dt, 200)
 

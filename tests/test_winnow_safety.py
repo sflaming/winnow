@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from photo_dupe import (
+from winnow import (
     PhotoDupeTUI,
     QUARANTINE_DIR_NAME,
     FileInfo,
@@ -311,7 +311,7 @@ class SafetyRulesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "A.PNG").write_bytes(b"png")
-            with patch("photo_dupe.ProcessPoolExecutor", side_effect=ValueError("bad value(s) in fds_to_keep")):
+            with patch("winnow.ProcessPoolExecutor", side_effect=ValueError("bad value(s) in fds_to_keep")):
                 infos = scan_directory_parallel_infos(root, "files")
             self.assertEqual(len(infos), 1)
             self.assertEqual(infos[0].ext, ".png")
@@ -324,8 +324,8 @@ class SafetyRulesTests(unittest.TestCase):
                 returncode = 0
                 stdout = str(root) + "\n"
 
-            with patch("photo_dupe.sys.platform", "darwin"):
-                with patch("photo_dupe.subprocess.run", return_value=Proc()):
+            with patch("winnow.sys.platform", "darwin"):
+                with patch("winnow.subprocess.run", return_value=Proc()):
                     picked = select_folder_native("Pick folder", initial=root)
             self.assertEqual(picked, root)
 
@@ -334,8 +334,8 @@ class SafetyRulesTests(unittest.TestCase):
             returncode = 1
             stdout = ""
 
-        with patch("photo_dupe.sys.platform", "darwin"):
-            with patch("photo_dupe.subprocess.run", return_value=Proc()):
+        with patch("winnow.sys.platform", "darwin"):
+            with patch("winnow.subprocess.run", return_value=Proc()):
                 picked = select_folder_native("Pick folder")
         self.assertIsNone(picked)
 

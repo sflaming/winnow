@@ -4,29 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Winnow (package name `winnow`) — a Textual TUI app that finds photos on an SD card that already exist on a destination drive, then lets the user review matches and quarantine (or legacy-rename) the SD copies. The active codebase is `photo_dupe.py`. The older `copied.py` and `copied.sh` predecessors are no longer tracked in the repo (kept on disk only, pending relocation).
+Winnow (package name `winnow`) — a Textual TUI app that finds photos on an SD card that already exist on a destination drive, then lets the user review matches and quarantine (or legacy-rename) the SD copies. The active codebase is `winnow.py`. The older `copied.py` and `copied.sh` predecessors are no longer tracked in the repo (kept on disk only, pending relocation).
 
 ## Commands
 
 ```bash
 # Run the TUI app
-uv run python photo_dupe.py
+uv run python winnow.py
 
 # Run all tests
 uv run python -m pytest tests/
 
 # Run a single test file
-uv run python -m pytest tests/test_photo_dupe_safety.py
+uv run python -m pytest tests/test_winnow_safety.py
 
 # Run a single test
-uv run python -m pytest tests/test_photo_dupe_safety.py::SafetyRulesTests::test_paths_overlap_detects_same_and_nested
+uv run python -m pytest tests/test_winnow_safety.py::SafetyRulesTests::test_paths_overlap_detects_same_and_nested
 ```
 
 Uses `uv` for dependency management (Python >=3.11). Dependencies: `textual`, `exifread`, `textual-image`, `pillow`, `rawpy`.
 
 ## Architecture
 
-Everything lives in a single file: `photo_dupe.py` (~2200 lines). Key sections in order:
+Everything lives in a single file: `winnow.py` (~2200 lines). Key sections in order:
 
 1. **Config constants** — extension sets (BLACKLIST, EXIF, RAW, IMAGE preview), hash parameters, quarantine/transaction log names
 2. **Data models** — `FileInfo` (frozen dataclass per file with EXIF metadata) and `MatchRow` (a paired SD↔Drive match with kind/reason)
@@ -42,10 +42,10 @@ Everything lives in a single file: `photo_dupe.py` (~2200 lines). Key sections i
 ## Tests
 
 Two test files in `tests/`, both using `unittest`:
-- `test_photo_dupe_safety.py` — core logic: matching, hashing, scanning, path safety, quarantine transactions, recent paths
-- `test_photo_dupe_preview.py` — preview pipeline: cache path stability, exiftool/rawpy extraction, fallback behavior
+- `test_winnow_safety.py` — core logic: matching, hashing, scanning, path safety, quarantine transactions, recent paths
+- `test_winnow_preview.py` — preview pipeline: cache path stability, exiftool/rawpy extraction, fallback behavior
 
-Tests import directly from `photo_dupe` (no package install needed). Use `tempfile.TemporaryDirectory` for isolation and `unittest.mock.patch` for subprocess/platform mocking.
+Tests import directly from `winnow` (no package install needed). Use `tempfile.TemporaryDirectory` for isolation and `unittest.mock.patch` for subprocess/platform mocking.
 
 ## Key Design Decisions
 

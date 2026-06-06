@@ -95,10 +95,10 @@ EXIF_CANDIDATE_EXTS = {
 PARTIAL_HASH_BYTES = 1024 * 1024
 PARTIAL_HASH_CHUNK = 256 * 1024
 FULL_HASH_CHUNK = 1024 * 1024
-QUARANTINE_DIR_NAME = ".photo_dupe_quarantine"
-TX_LOG_NAME = ".photo_dupe_transactions.jsonl"
+QUARANTINE_DIR_NAME = ".winnow_quarantine"
+TX_LOG_NAME = ".winnow_transactions.jsonl"
 CONFIRM_WINDOW_SECONDS = 8.0
-RECENT_PATHS_FILE = Path.home() / ".photo_dupe_recent_paths.json"
+RECENT_PATHS_FILE = Path.home() / ".winnow_recent_paths.json"
 MAX_RECENT_PATHS = 12
 RAW_PREVIEW_EXTENSIONS = {
     ".raf",
@@ -120,7 +120,7 @@ IMAGE_PREVIEW_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
-PREVIEW_CACHE_DIR = Path(tempfile.gettempdir()) / "photo_dupe_preview_cache"
+PREVIEW_CACHE_DIR = Path(tempfile.gettempdir()) / "winnow_preview_cache"
 PREVIEW_CMD_TIMEOUT_SECONDS = 4.0
 PHOTO_CLUSTER_GAP_SECONDS = 2
 NAME_SCAN_FOLDER_FIELD_ID = "__name_scan_folder__"
@@ -1280,7 +1280,7 @@ def resolve_preview_image(path: Path) -> Tuple[Optional[Path], str]:
 # Textual App
 # -----------------------------
 
-class PhotoDupeTUI(App):
+class WinnowTUI(App):
     TITLE = "Winnow — Photo Duplicate Finder (EXIF-aware TUI)"
 
     CSS = """
@@ -2587,7 +2587,7 @@ class PhotoDupeTUI(App):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Photo Duplicate Finder TUI (EXIF-aware + picker)")
     _ = parser.parse_args(argv)
-    PhotoDupeTUI().run()
+    WinnowTUI().run()
     return 0
 
 

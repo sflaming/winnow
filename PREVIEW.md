@@ -117,6 +117,6 @@ falls back to a Unicode block-character approximation.
 
 ## Cached previews
 
-Extracted RAW previews are cached in `/tmp/photo_dupe_preview_cache/`.
+Extracted RAW previews are cached in `/tmp/winnow_preview_cache/`.
 The cache key includes the file's path, modification time, and size, so
 it auto-invalidates when files change.

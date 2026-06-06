@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from winnow import (
-    PhotoDupeTUI,
+    WinnowTUI,
     QUARANTINE_DIR_NAME,
     FileInfo,
     clear_exif_cache,
@@ -395,7 +395,7 @@ class SafetyRulesTests(unittest.TestCase):
             (root / "sub").mkdir()
             (root / "sub" / "C_0003.jpg").write_bytes(b"x")
 
-            app = PhotoDupeTUI()
+            app = WinnowTUI()
             hits = app._files_with_substring_in_name(root, "COPIED")
             names = sorted(p.name for p in hits)
             self.assertEqual(names, ["A_COPIED_0001.jpg", "B_0002.COPIED.jpg"])

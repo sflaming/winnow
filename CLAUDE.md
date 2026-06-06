@@ -35,9 +35,9 @@ Everything lives in a single file: `winnow.py` (~2200 lines). Key sections in or
 5. **Lazy EXIF loading** — `load_exif_for_fileinfo()` and `load_exif_for_matches()` defer EXIF reading to post-match phase for speed. Module-level `_exif_cache` avoids re-reading.
 6. **Scanning** — `scan_directory_parallel_infos()` walks a directory, chunks the file list, and processes in parallel (ThreadPoolExecutor when off main thread, ProcessPoolExecutor with fallback otherwise). EXIF is NOT read during scan — only path/stem/ext/size/mtime are collected.
 7. **Matching** — `find_matches_hybrid()` matches SD→Drive by exact stem+ext+size (with partial/full blake2b hash disambiguation), optional substring fallback. `find_content_matches()` catches renamed duplicates via size+hash matching. EXIF-time correlation is intentionally disabled to avoid burst-shot false positives.
-8. **Safety** — quarantine moves files to `.photo_dupe_quarantine/` with a JSONL transaction log (`.photo_dupe_transactions.jsonl`), enabling undo. Destructive actions require a second button press within a confirmation window.
+8. **Safety** — quarantine moves files to `.winnow_quarantine/` with a JSONL transaction log (`.winnow_transactions.jsonl`), enabling undo. Destructive actions require a second button press within a confirmation window.
 9. **Preview pipeline** — resolves preview images (direct for JPG/PNG, exiftool/rawpy extraction for RAW), renders side-by-side via `textual-image` widgets (sixel/iTerm2/kitty with auto-fallback).
-10. **TUI (`PhotoDupeTUI`)** — the main Textual `App`. Three-column layout: left (cross-format filters + selection controls), middle (matches DataTable + compare panel), right (side-by-side image preview panel). Workers run on background threads via `run_worker(thread=True)` and post back with `call_from_thread`.
+10. **TUI (`WinnowTUI`)** — the main Textual `App`. Three-column layout: left (cross-format filters + selection controls), middle (matches DataTable + compare panel), right (side-by-side image preview panel). Workers run on background threads via `run_worker(thread=True)` and post back with `call_from_thread`.
 
 ## Tests
 

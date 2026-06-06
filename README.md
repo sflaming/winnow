@@ -9,7 +9,7 @@ Winnow scans an SD card (or any source folder) against a destination drive, find
 - **Reliable duplicate detection** — matches by name + size with partial/full BLAKE2b hashing to confirm, plus content-only matching to catch files that were renamed after copying.
 - **EXIF-aware review** — capture time, camera model, lens, and dimensions are shown for each match. EXIF is loaded only for matched files, so scanning stays fast.
 - **Side-by-side previews** — real image previews rendered in the terminal (sixel / iTerm2 / kitty, with automatic fallback), including embedded previews extracted from RAW files.
-- **Safe by design** — duplicates are moved to a `.photo_dupe_quarantine/` folder with a JSONL transaction log, so every quarantine and rename can be undone. Destructive actions require a confirming second press.
+- **Safe by design** — duplicates are moved to a `.winnow_quarantine/` folder with a JSONL transaction log, so every quarantine and rename can be undone. Destructive actions require a confirming second press.
 - **Name-substring scan & rename** — find and rewrite a substring across filenames (e.g. strip an import prefix) in bulk.
 
 ## Requirements

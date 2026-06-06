@@ -23,8 +23,8 @@ __pycache__/
 .DS_Store
 
 # Runtime artifacts
-.photo_dupe_quarantine/
-.photo_dupe_transactions.jsonl
+.winnow_quarantine/
+.winnow_transactions.jsonl
 
 # Legacy predecessors — kept on disk, to be relocated out of the repo later
 /copied.py

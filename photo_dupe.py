@@ -123,6 +123,7 @@ IMAGE_PREVIEW_EXTENSIONS = {
 PREVIEW_CACHE_DIR = Path(tempfile.gettempdir()) / "photo_dupe_preview_cache"
 PREVIEW_CMD_TIMEOUT_SECONDS = 4.0
 PHOTO_CLUSTER_GAP_SECONDS = 2
+NAME_SCAN_FOLDER_FIELD_ID = "__name_scan_folder__"
 PROCESS_POOL_BROKEN = False
 PROCESS_POOL_BROKEN_REASON = ""
 
@@ -683,12 +684,25 @@ def exif_candidates_within_tolerance(
     return cands
 
 
+def normalize_sd_stem_for_substring(sd_stem: str, strip_token: str) -> str:
+    if not strip_token:
+        return sd_stem
+    if not sd_stem.startswith(strip_token):
+        return sd_stem
+    stripped = sd_stem[len(strip_token):]
+    # Avoid empty normalized stem, since "" in any string is True.
+    if not stripped:
+        return sd_stem
+    return stripped
+
+
 def find_matches_hybrid(
     sd_infos: List[FileInfo],
     drive_infos: List[FileInfo],
     *,
     enable_substring_fallback: bool,
     exif_tolerance_seconds: int,
+    sd_stem_strip_token: str = "",
 ) -> Tuple[List[MatchRow], List[str]]:
     # EXIF-time correlation is intentionally disabled due to burst-shot false positives.
     _ = exif_tolerance_seconds
@@ -759,7 +773,7 @@ def find_matches_hybrid(
 
         # 2) substring fallback (legacy) only if no exact match
         if enable_substring_fallback and (not has_primary_exact):
-            sd_stem = sd.stem
+            sd_stem = normalize_sd_stem_for_substring(sd.stem, sd_stem_strip_token)
             sd_ext = sd.ext
 
             # exact-ext substring
@@ -899,6 +913,26 @@ def rename_file_with_prefix(sd_file: Path, prefix: str) -> Tuple[bool, str]:
         return True, f"RENAMED: {sd_file.name} -> {new_name.name}"
     except Exception as e:
         return False, f"ERROR: {sd_file.name}: {e}"
+
+
+def rename_file_replace_substring(sd_file: Path, needle: str, replacement: str) -> Tuple[bool, str, Optional[Path]]:
+    stem = sd_file.stem
+    if needle not in stem:
+        return False, f"SKIP no match: {sd_file.name}", None
+
+    new_stem = stem.replace(needle, replacement)
+    if new_stem == stem:
+        return False, f"SKIP unchanged: {sd_file.name}", None
+
+    new_name = sd_file.with_name(f"{new_stem}{sd_file.suffix}")
+    if new_name.exists():
+        return False, f"SKIP exists: {new_name.name}", None
+
+    try:
+        sd_file.rename(new_name)
+        return True, f"RENAMED: {sd_file.name} -> {new_name.name}", new_name
+    except Exception as e:
+        return False, f"ERROR: {sd_file.name}: {e}", None
 
 
 def paths_overlap(a: Path, b: Path) -> bool:
@@ -1252,25 +1286,30 @@ class PhotoDupeTUI(App):
     CSS = """
     Screen { layout: vertical; }
 
-    #toolbar { height: auto; max-height: 14; padding: 0 1; }
+    #toolbar { height: auto; max-height: 14; padding: 0 1; overflow-y: auto; }
     #paths_row { height: auto; }
-    #paths_row .path_col { width: 1fr; padding-right: 1; }
+    #paths_row .path_col { width: 1fr; height: auto; padding-right: 1; }
     #paths_row .path_col Input { width: 1fr; }
     #paths_row .path_col Select { width: 1fr; }
-    #paths_row #btn_col { width: auto; min-width: 18; }
+    #paths_row #btn_col { width: auto; height: auto; min-width: 18; }
     #paths_row #btn_col Button { width: 100%; }
     #options_row { height: auto; margin-top: 1; }
+    #rename_row { height: auto; margin-top: 1; }
+    #rename_tools_row { height: auto; margin-top: 1; }
     #prefix_input { width: 16; }
     #options_row Button { width: auto; min-width: 10; }
-    #options_row Static { width: auto; padding: 0 1 0 0; }
+    #rename_find_input { width: 18; }
+    #rename_replace_input { width: 18; }
+    #options_row Static, #rename_row Static, #rename_tools_row Static { width: auto; padding: 0 1 0 0; }
+    #rename_row Button, #rename_tools_row Button { width: auto; min-width: 10; }
     #status { height: auto; }
     #progress_bar { height: 1; display: none; }
     #progress_bar.visible { display: block; }
 
-    #main { height: 1fr; min-height: 12; }
-    #table_area { height: 3fr; min-height: 8; }
+    #main { height: 1fr; min-height: 0; }
+    #table_area { height: 1fr; min-height: 6; }
     #matches_table { height: 1fr; }
-    #detail_area { height: 2fr; min-height: 6; }
+    #detail_area { height: 1fr; min-height: 6; }
     #compare_panel { width: 1fr; height: 1fr; border: round $accent; padding: 1; overflow-y: auto; }
     #preview_panel { width: 1fr; height: 1fr; border: round $accent; padding: 0; overflow: hidden; }
     .preview-placeholder { width: 1fr; height: 1fr; padding: 1; content-align: center middle; }
@@ -1306,6 +1345,10 @@ class PhotoDupeTUI(App):
     preview_focus_row: Optional[MatchRow] = None
     selected_match_keys: set[str] = set()
     cluster_by_match_key: Dict[str, str] = {}
+    name_scan_folder: Optional[Path] = None
+    name_scan_needle: str = ""
+    name_scan_targets: List[Path] = []
+    pending_name_scan_needle: str = ""
     def compose(self) -> ComposeResult:
         yield Header()
 
@@ -1328,14 +1371,23 @@ class PhotoDupeTUI(App):
                 yield Switch(value=True, id="substring_switch")
                 yield Static("Content match:")
                 yield Switch(value=True, id="content_match_switch")
+                yield Button("Filters", id="filters_btn")
+                yield Button("Clear", id="clear_btn")
+            with Horizontal(id="rename_row"):
                 yield Static("Prefix:")
                 yield Input(value="COPIED_", id="prefix_input")
                 yield Button("Rename", id="rename_btn", variant="success")
                 yield Button("Quarantine", id="quarantine_btn", variant="warning")
                 yield Button("Undo", id="undo_btn")
                 yield Button("View Q", id="view_quarantine_btn")
-                yield Button("Filters", id="filters_btn")
-                yield Button("Clear", id="clear_btn")
+            with Horizontal(id="rename_tools_row"):
+                yield Static("Find in name / scan strip:")
+                yield Input(placeholder="COPIED_", id="rename_find_input")
+                yield Static("Replace with:")
+                yield Input(placeholder="ARCHIVED_", id="rename_replace_input")
+                yield Button("Scan names", id="rename_scan_names_btn")
+                yield Button("Replace text", id="rename_replace_btn")
+                yield Button("Remove text", id="rename_remove_btn")
 
         yield Static("", id="status")
         yield ProgressBar(total=100, id="progress_bar")
@@ -1385,6 +1437,12 @@ class PhotoDupeTUI(App):
             self.action_view_quarantine()
         elif bid == "clear_btn":
             self.action_clear()
+        elif bid == "rename_replace_btn":
+            self.action_replace_name_substring()
+        elif bid == "rename_remove_btn":
+            self.action_remove_name_substring()
+        elif bid == "rename_scan_names_btn":
+            self.action_scan_names_for_substring()
         elif bid == "pick_drive_btn":
             self.action_pick_folder("drive_input")
         elif bid == "pick_sd_btn":
@@ -1397,6 +1455,11 @@ class PhotoDupeTUI(App):
     # -----------------
 
     def on_folder_picked(self, message: FolderPicked) -> None:
+        if message.field_id == NAME_SCAN_FOLDER_FIELD_ID:
+            needle = self.pending_name_scan_needle or self.query_one("#rename_find_input", Input).value.strip()
+            self.pending_name_scan_needle = ""
+            self._start_name_substring_scan(message.path, needle)
+            return
         self._set_input_path(message.field_id, message.path)
 
     # -----------------
@@ -1435,8 +1498,12 @@ class PhotoDupeTUI(App):
             def mount_images() -> None:
                 # File may have been quarantined/renamed between resolve and mount.
                 if sd_img is not None and not sd_img.exists():
+                    panel.remove_children()
+                    panel.mount(Static("Preview unavailable: SD file was moved or renamed.", classes="preview-placeholder"))
                     return
                 if drv_img is not None and not drv_img.exists():
+                    panel.remove_children()
+                    panel.mount(Static("Preview unavailable: Drive file was moved or renamed.", classes="preview-placeholder"))
                     return
 
                 panel.remove_children()
@@ -1448,13 +1515,19 @@ class PhotoDupeTUI(App):
 
                 sd_container.mount(Static(f"SD: {captured_row.sd.path.name}", classes="preview-label"))
                 if sd_img is not None:
-                    sd_container.mount(image_widget_factory(sd_img, classes="preview-image"))
+                    try:
+                        sd_container.mount(image_widget_factory(sd_img, classes="preview-image"))
+                    except Exception as e:
+                        sd_container.mount(Static(f"No preview: {e}", classes="preview-image"))
                 else:
                     sd_container.mount(Static(f"No preview: {sd_note}", classes="preview-image"))
 
                 drv_container.mount(Static(f"Drive: {captured_row.drive.path.name}", classes="preview-label"))
                 if drv_img is not None:
-                    drv_container.mount(image_widget_factory(drv_img, classes="preview-image"))
+                    try:
+                        drv_container.mount(image_widget_factory(drv_img, classes="preview-image"))
+                    except Exception as e:
+                        drv_container.mount(Static(f"No preview: {e}", classes="preview-image"))
                 else:
                     drv_container.mount(Static(f"No preview: {drv_note}", classes="preview-image"))
 
@@ -1522,6 +1595,141 @@ class PhotoDupeTUI(App):
                 seen.add(m.sd.path)
                 out.append(m.sd.path)
         return out
+
+    def _fileinfo_with_new_path(self, fi: FileInfo, new_path: Path) -> FileInfo:
+        return FileInfo(
+            path=new_path,
+            stem=new_path.stem,
+            ext=new_path.suffix.lower(),
+            size=fi.size,
+            mtime=fi.mtime,
+            exif_dt=fi.exif_dt,
+            camera_model=fi.camera_model,
+            lens_model=fi.lens_model,
+            width=fi.width,
+            height=fi.height,
+        )
+
+    def _apply_path_rename_map(self, rename_map: Dict[Path, Path]) -> None:
+        if not rename_map:
+            return
+
+        old_matches = list(self.all_matches)
+        old_selected = set(self.selected_match_keys)
+        old_focus_key = self._match_key(self.preview_focus_row) if self.preview_focus_row else None
+
+        new_matches: List[MatchRow] = []
+        new_selected: set[str] = set()
+        new_focus: Optional[MatchRow] = None
+
+        for old_m in old_matches:
+            old_key = self._match_key(old_m)
+            sd = self._fileinfo_with_new_path(old_m.sd, rename_map[old_m.sd.path]) if old_m.sd.path in rename_map else old_m.sd
+            drv = self._fileinfo_with_new_path(old_m.drive, rename_map[old_m.drive.path]) if old_m.drive.path in rename_map else old_m.drive
+            new_m = MatchRow(
+                kind=old_m.kind,
+                sd=sd,
+                drive=drv,
+                format_type=old_m.format_type,
+                reason=old_m.reason,
+            )
+            new_matches.append(new_m)
+            new_key = self._match_key(new_m)
+            if old_key in old_selected:
+                new_selected.add(new_key)
+            if old_focus_key and old_key == old_focus_key:
+                new_focus = new_m
+
+        self.all_matches = new_matches
+        self.selected_match_keys = new_selected
+        self.preview_focus_row = new_focus
+        self._rebuild_clusters()
+
+    def _iter_sd_files(self, sd_root: Path) -> List[Path]:
+        out: List[Path] = []
+        for root, dirs, files in os.walk(sd_root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            root_path = Path(root)
+            for name in files:
+                if name.startswith("."):
+                    continue
+                p = root_path / name
+                if p.is_file():
+                    out.append(p)
+        return out
+
+    def _files_with_substring_in_name(self, root: Path, needle: str) -> List[Path]:
+        needle_s = needle.strip()
+        if not needle_s:
+            return []
+        out: List[Path] = []
+        for p in self._iter_sd_files(root):
+            if needle_s in p.name:
+                out.append(p)
+        out.sort(key=lambda p: str(p).lower())
+        return out
+
+    def _default_name_scan_start(self) -> Path:
+        start = self.name_scan_folder or self._get_sd_root_from_input() or self.last_sd_root
+        if start is not None and start.exists() and start.is_dir():
+            return start
+        if Path.home().exists():
+            return Path.home()
+        return Path("C:\\") if os.name == "nt" else Path("/")
+
+    def _start_name_substring_scan(self, folder: Path, needle: str) -> None:
+        needle_s = needle.strip()
+        if not needle_s:
+            self._set_status("Find text is required.")
+            return
+        self._set_status(f"Scanning folder for '{needle_s}' in filenames: {folder}")
+        self.run_worker(
+            lambda: self._scan_name_substring_worker(folder, needle_s),
+            exclusive=False,
+            name="scan_name_substring_worker",
+            thread=True,
+        )
+
+    def _scan_name_substring_worker(self, folder: Path, needle: str) -> None:
+        worker = get_current_worker()
+        targets = self._files_with_substring_in_name(folder, needle)
+        if worker.is_cancelled:
+            return
+
+        def done() -> None:
+            self.name_scan_folder = folder
+            self.name_scan_needle = needle
+            self.name_scan_targets = targets
+            if not targets:
+                self._set_status(f"No filenames in {folder} contain '{needle}'.")
+                return
+            self._set_status(
+                f"Found {len(targets)} filenames containing '{needle}' in {folder}. "
+                "Use Replace text or Remove text."
+            )
+
+        self.call_from_thread(done)
+
+    def _rename_targets_from_last_scan(self, needle: str) -> Optional[List[Path]]:
+        if not needle:
+            self._set_status("Find text is required.")
+            return None
+        if self.name_scan_folder is None:
+            self._set_status("Use 'Scan names' first to pick a folder and find filenames.")
+            return None
+        if self.name_scan_needle != needle:
+            self._set_status("Find text changed. Run 'Scan names' again for the current text.")
+            return None
+
+        if not self.name_scan_targets:
+            self._set_status("Last 'Scan names' found no matches. Scan again with a different folder or text.")
+            return None
+
+        targets = [p for p in self.name_scan_targets if p.exists() and p.is_file()]
+        if not targets:
+            self._set_status("Scanned targets are no longer available. Run 'Scan names' again.")
+            return None
+        return targets
 
     def _format_compare_panel(self, row: Optional[MatchRow]) -> str:
         if row is None:
@@ -1773,6 +1981,37 @@ class PhotoDupeTUI(App):
         self.call_from_thread(self._set_input_path, field_id, picked)
         self.call_from_thread(self._set_status, f"Selected {label}: {picked}")
 
+    def action_scan_names_for_substring(self) -> None:
+        self._clear_pending_confirmation()
+        needle = self.query_one("#rename_find_input", Input).value.strip()
+        if not needle:
+            self._set_status("Find text is required.")
+            return
+
+        start = self._default_name_scan_start()
+        self.pending_name_scan_needle = needle
+
+        if sys.platform == "darwin":
+            self._set_status("Opening native folder picker for filename text scan…")
+            self.run_worker(
+                lambda: self._pick_name_scan_folder_native_worker(needle, start),
+                exclusive=False,
+                name="name_scan_pick_native_worker",
+                thread=True,
+            )
+            return
+
+        self.push_screen(FolderPicker(field_id=NAME_SCAN_FOLDER_FIELD_ID, start_path=start))
+
+    def _pick_name_scan_folder_native_worker(self, needle: str, start: Path) -> None:
+        picked = select_folder_native("Select folder to scan filenames", initial=start)
+        if picked is None:
+            self.pending_name_scan_needle = ""
+            self.call_from_thread(self._set_status, "Native folder picker canceled for filename text scan.")
+            return
+        self.pending_name_scan_needle = ""
+        self.call_from_thread(self._start_name_substring_scan, picked, needle)
+
     def action_clear(self) -> None:
         self._clear_pending_confirmation()
         self.all_matches = []
@@ -1782,6 +2021,10 @@ class PhotoDupeTUI(App):
         self.cluster_by_match_key = {}
         self.last_sd_root = None
         self.preview_focus_row = None
+        self.name_scan_folder = None
+        self.name_scan_needle = ""
+        self.name_scan_targets = []
+        self.pending_name_scan_needle = ""
         self.query_one("#formats_popup").remove_class("visible")
         self.query_one("#formats_list", SelectionList).clear_options()
         self.query_one("#matches_table", DataTable).clear()
@@ -1792,6 +2035,10 @@ class PhotoDupeTUI(App):
     def action_scan(self) -> None:
         self._clear_pending_confirmation()
         drive_path, sd_path, _, substring = self._read_inputs()
+        scan_strip_token = self.query_one("#rename_find_input", Input).value.strip()
+        scan_strip_desc = (
+            f"scan strip token='{scan_strip_token}'" if scan_strip_token else "scan strip token=off"
+        )
         if drive_path is None or sd_path is None:
             self._set_status("Both Drive path and SD path are required.")
             return
@@ -1808,9 +2055,9 @@ class PhotoDupeTUI(App):
         self._remember_recent("drive", drive_path)
         self._remember_recent("sd", sd_path)
         self.last_sd_root = sd_path
-        self._set_status("Starting scan…")
+        self._set_status(f"Starting scan… ({scan_strip_desc})")
         self.run_worker(
-            lambda: self._scan_worker(drive_path, sd_path, substring),
+            lambda: self._scan_worker(drive_path, sd_path, substring, scan_strip_token),
             exclusive=True,
             name="scan_worker",
             thread=True,
@@ -1828,8 +2075,17 @@ class PhotoDupeTUI(App):
         else:
             bar.remove_class("visible")
 
-    def _scan_worker(self, drive_path: Path, sd_path: Path, substring: bool) -> None:
+    def _scan_worker(
+        self,
+        drive_path: Path,
+        sd_path: Path,
+        substring: bool,
+        scan_strip_token: str,
+    ) -> None:
         worker = get_current_worker()
+        scan_strip_desc = (
+            f"scan strip token='{scan_strip_token}'" if scan_strip_token else "scan strip token=off"
+        )
 
         # Phase weights: drive 40%, SD 40%, name match 8%, content match 7%, EXIF 5%
         clear_exif_cache()
@@ -1883,6 +2139,7 @@ class PhotoDupeTUI(App):
             drive_infos,
             enable_substring_fallback=substring,
             exif_tolerance_seconds=0,
+            sd_stem_strip_token=scan_strip_token,
         )
 
         if worker.is_cancelled:
@@ -1923,7 +2180,8 @@ class PhotoDupeTUI(App):
 
             if not matches:
                 self._set_status(
-                    f"No matches found. substring fallback={'on' if substring else 'off'}."
+                    f"No matches found. substring fallback={'on' if substring else 'off'}; "
+                    f"{scan_strip_desc}."
                 )
                 return
 
@@ -1931,7 +2189,7 @@ class PhotoDupeTUI(App):
             cross_total = sum(1 for m in matches if m.kind == "CROSS")
             self._set_status(
                 f"Scan complete — matches: {len(matches)} (Exact {exact_total}, Cross {cross_total}). "
-                f"substring fallback={'on' if substring else 'off'}."
+                f"substring fallback={'on' if substring else 'off'}; {scan_strip_desc}."
             )
 
         self.call_from_thread(done)
@@ -2212,6 +2470,81 @@ class PhotoDupeTUI(App):
             thread=True,
         )
 
+    def action_replace_name_substring(self) -> None:
+        needle = self.query_one("#rename_find_input", Input).value.strip()
+        replacement = self.query_one("#rename_replace_input", Input).value
+        targets = self._rename_targets_from_last_scan(needle)
+        if targets is None:
+            return
+
+        if not self._confirm_or_arm("rename_replace", "replace filename text", len(targets)):
+            return
+
+        self._set_status(f"Replacing '{needle}' -> '{replacement}' in {len(targets)} filenames…")
+        self.run_worker(
+            lambda: self._rename_substring_worker(targets, needle, replacement, "replace"),
+            exclusive=True,
+            name="rename_replace_worker",
+            thread=True,
+        )
+
+    def action_remove_name_substring(self) -> None:
+        needle = self.query_one("#rename_find_input", Input).value.strip()
+        targets = self._rename_targets_from_last_scan(needle)
+        if targets is None:
+            return
+
+        if not self._confirm_or_arm("rename_remove", "remove filename text", len(targets)):
+            return
+
+        self._set_status(f"Removing '{needle}' from {len(targets)} filenames…")
+        self.run_worker(
+            lambda: self._rename_substring_worker(targets, needle, "", "remove"),
+            exclusive=True,
+            name="rename_remove_worker",
+            thread=True,
+        )
+
+    def _rename_substring_worker(
+        self,
+        targets: List[Path],
+        needle: str,
+        replacement: str,
+        mode: str,
+    ) -> None:
+        worker = get_current_worker()
+        total = len(targets)
+        ok = 0
+        skipped = 0
+        errors = 0
+        rename_map: Dict[Path, Path] = {}
+
+        for i, p in enumerate(targets, 1):
+            if worker.is_cancelled:
+                return
+            success, msg, dst = rename_file_replace_substring(p, needle, replacement)
+            if success and dst is not None:
+                ok += 1
+                rename_map[p] = dst
+            else:
+                if msg.startswith("SKIP"):
+                    skipped += 1
+                else:
+                    errors += 1
+            self.call_from_thread(self._set_status, f"{msg} ({i}/{total})")
+
+        status = (
+            f"Name {mode} complete. Renamed {ok}/{total}. Skipped {skipped}. Errors {errors}."
+        )
+
+        def finish_name_rename() -> None:
+            if rename_map:
+                self._apply_path_rename_map(rename_map)
+                self._refresh_matches_table()
+            self._set_status(status)
+
+        self.call_from_thread(finish_name_rename)
+
     def _apply_worker(self, filtered: List[MatchRow], prefix: str) -> None:
         worker = get_current_worker()
 
@@ -2222,6 +2555,7 @@ class PhotoDupeTUI(App):
         ok = 0
         skipped = 0
         errors = 0
+        rename_map: Dict[Path, Path] = {}
 
         for i, sd_file in enumerate(sd_unique, 1):
             if worker.is_cancelled:
@@ -2229,6 +2563,7 @@ class PhotoDupeTUI(App):
             success, msg = rename_file_with_prefix(sd_file, prefix)
             if success:
                 ok += 1
+                rename_map[sd_file] = sd_file.parent / f"{prefix}{sd_file.name}"
             else:
                 if msg.startswith("SKIP"):
                     skipped += 1
@@ -2236,10 +2571,17 @@ class PhotoDupeTUI(App):
                     errors += 1
             self.call_from_thread(self._set_status, f"{msg} ({i}/{total})")
 
-        self.call_from_thread(
-            self._set_status,
-            f"Rename complete. Renamed {ok}/{total}. Skipped {skipped}. Errors {errors}. Re-scan to refresh.",
+        status = (
+            f"Rename complete. Renamed {ok}/{total}. Skipped {skipped}. Errors {errors}."
         )
+
+        def finish_rename() -> None:
+            if rename_map:
+                self._apply_path_rename_map(rename_map)
+                self._refresh_matches_table()
+            self._set_status(status)
+
+        self.call_from_thread(finish_rename)
 
 
 def main(argv=None) -> int:

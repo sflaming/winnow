@@ -4,17 +4,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 from photo_dupe import (
+    PhotoDupeTUI,
+    QUARANTINE_DIR_NAME,
     FileInfo,
     clear_exif_cache,
     find_content_matches,
     find_last_pending_tx,
     find_matches_hybrid,
+    normalize_sd_stem_for_substring,
     full_hash_file,
     load_exif_for_fileinfo,
     load_recent_paths,
     partial_hash_file,
     paths_overlap,
     remember_recent_path,
+    rename_file_replace_substring,
     scan_chunk_build_info,
     scan_directory_parallel_infos,
     save_recent_paths,
@@ -146,6 +150,81 @@ class SafetyRulesTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].reason, "Substring stem match (legacy)")
 
+    def test_substring_prefixed_sd_matches_when_scan_strip_token_set(self) -> None:
+        sd = FileInfo(
+            path=Path("/sd/COPIED_IMG_0002.jpg"),
+            stem="COPIED_IMG_0002",
+            ext=".jpg",
+            size=100,
+            mtime=0,
+            exif_dt=None,
+        )
+        drv = FileInfo(
+            path=Path("/drv/IMG_0002_EDIT.jpg"),
+            stem="IMG_0002_EDIT",
+            ext=".jpg",
+            size=99,
+            mtime=0,
+            exif_dt=None,
+        )
+        matches, _ = find_matches_hybrid(
+            [sd],
+            [drv],
+            enable_substring_fallback=True,
+            exif_tolerance_seconds=0,
+            sd_stem_strip_token="COPIED_",
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].reason, "Substring stem match (legacy)")
+
+    def test_substring_prefixed_sd_no_match_without_scan_strip_token(self) -> None:
+        sd = FileInfo(
+            path=Path("/sd/COPIED_IMG_0002.jpg"),
+            stem="COPIED_IMG_0002",
+            ext=".jpg",
+            size=100,
+            mtime=0,
+            exif_dt=None,
+        )
+        drv = FileInfo(
+            path=Path("/drv/IMG_0002_EDIT.jpg"),
+            stem="IMG_0002_EDIT",
+            ext=".jpg",
+            size=99,
+            mtime=0,
+            exif_dt=None,
+        )
+        matches, _ = find_matches_hybrid(
+            [sd],
+            [drv],
+            enable_substring_fallback=True,
+            exif_tolerance_seconds=0,
+            sd_stem_strip_token="",
+        )
+        self.assertEqual(matches, [])
+
+    def test_scan_strip_token_is_leading_once_and_case_sensitive(self) -> None:
+        self.assertEqual(
+            normalize_sd_stem_for_substring("COPIED_IMG_0001", "COPIED_"),
+            "IMG_0001",
+        )
+        self.assertEqual(
+            normalize_sd_stem_for_substring("COPIED_COPIED_IMG_0001", "COPIED_"),
+            "COPIED_IMG_0001",
+        )
+        self.assertEqual(
+            normalize_sd_stem_for_substring("IMG_COPIED_0001", "COPIED_"),
+            "IMG_COPIED_0001",
+        )
+        self.assertEqual(
+            normalize_sd_stem_for_substring("COPIED_IMG_0001", "copied_"),
+            "COPIED_IMG_0001",
+        )
+        self.assertEqual(
+            normalize_sd_stem_for_substring("COPIED_", "COPIED_"),
+            "COPIED_",
+        )
+
     def test_exif_time_is_not_used_for_matching(self) -> None:
         sd = FileInfo(
             path=Path("/sd/BURST_0001.jpg"),
@@ -182,6 +261,41 @@ class SafetyRulesTests(unittest.TestCase):
             b.write_bytes(b"x" * 2048 + b"y")
             self.assertEqual(partial_hash_file(a), partial_hash_file(b))
             self.assertEqual(full_hash_file(a), full_hash_file(b))
+
+    def test_rename_file_replace_substring_replaces_in_stem_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            p = root / "COPIED_IMG_0001.jpg"
+            p.write_bytes(b"x")
+            ok, msg, dst = rename_file_replace_substring(p, "COPIED_", "DONE_")
+            self.assertTrue(ok, msg)
+            self.assertIsNotNone(dst)
+            assert dst is not None
+            self.assertEqual(dst.name, "DONE_IMG_0001.jpg")
+            self.assertTrue(dst.exists())
+
+    def test_rename_file_replace_substring_remove_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            p = root / "COPIED_IMG_0001.jpg"
+            p.write_bytes(b"x")
+            ok, msg, dst = rename_file_replace_substring(p, "COPIED_", "")
+            self.assertTrue(ok, msg)
+            self.assertIsNotNone(dst)
+            assert dst is not None
+            self.assertEqual(dst.name, "IMG_0001.jpg")
+            self.assertTrue(dst.exists())
+
+    def test_rename_file_replace_substring_skips_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            p = root / "IMG_0001.jpg"
+            p.write_bytes(b"x")
+            ok, msg, dst = rename_file_replace_substring(p, "COPIED_", "")
+            self.assertFalse(ok)
+            self.assertIn("SKIP", msg)
+            self.assertIsNone(dst)
+            self.assertTrue(p.exists())
 
     def test_find_last_pending_tx(self) -> None:
         records = [
@@ -258,6 +372,33 @@ class SafetyRulesTests(unittest.TestCase):
             self.assertIsNone(fi.lens_model)
             self.assertIsNone(fi.width)
             self.assertIsNone(fi.height)
+
+    def test_scan_excludes_quarantine_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keep = root / "keep.jpg"
+            qdir = root / QUARANTINE_DIR_NAME
+            qfile = qdir / "skip.jpg"
+            keep.write_bytes(b"keep")
+            qdir.mkdir()
+            qfile.write_bytes(b"skip")
+
+            infos = scan_directory_parallel_infos(root, "files")
+            names = sorted(fi.path.name for fi in infos)
+            self.assertEqual(names, ["keep.jpg"])
+
+    def test_files_with_substring_in_name_matches_anywhere_in_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "A_COPIED_0001.jpg").write_bytes(b"x")
+            (root / "B_0002.COPIED.jpg").write_bytes(b"x")
+            (root / "sub").mkdir()
+            (root / "sub" / "C_0003.jpg").write_bytes(b"x")
+
+            app = PhotoDupeTUI()
+            hits = app._files_with_substring_in_name(root, "COPIED")
+            names = sorted(p.name for p in hits)
+            self.assertEqual(names, ["A_COPIED_0001.jpg", "B_0002.COPIED.jpg"])
 
     def test_content_match_finds_renamed_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

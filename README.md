@@ -1,188 +1,43 @@
-# Photo Duplicate Finder and Renamer
+# Winnow
 
-Two versions available: Shell (v1.0) and Python (v2.0 - **RECOMMENDED**)
+A [Textual](https://textual.textualize.io/) terminal UI for clearing your SD card with confidence.
 
-## Overview
-
-Quickly identify and rename photos on an SD card that already exist on a specified drive, ensuring duplicates are clearly marked for easy organization and cleanup.
-
-## Version Comparison
-
-### Shell Version (copied.sh)
-- **Language**: zsh
-- **Speed**: Baseline
-- **Dependencies**: Native macOS/zsh
-- **Best for**: Small datasets (< 1000 files)
-
-### Python Version (copied.py) ⭐ RECOMMENDED
-- **Language**: Python 3
-- **Speed**: **5-10x faster** than shell version
-- **Dependencies**: Python 3 (pre-installed on macOS)
-- **Best for**: Any size dataset
-- **Matching**: Substring matching (like shell version)
-- **Debug Mode**: `--verbose` flag for troubleshooting
-
-## Performance Improvements in Python Version
-
-1. **Parallel Directory Scanning**: Scans both directories simultaneously using multiprocessing
-2. **Hash-based Lookups**: O(1) dictionary lookups instead of O(n×m) nested loops
-3. **Chunked Processing**: Distributes file processing across CPU cores
-4. **Optimized Data Structures**: Uses Python dictionaries instead of shell arrays
-5. **Progress Indicators**: Real-time feedback during long operations
-
-### Expected Performance
-
-| Files on Drive | Files on SD Card | Shell Script | Python Script |
-|----------------|------------------|--------------|---------------|
-| 1,000          | 500              | ~30 sec      | ~5 sec        |
-| 10,000         | 1,000            | ~10 min      | ~1 min        |
-| 50,000         | 2,000            | ~1 hour      | ~5 min        |
-
-*Actual times vary based on hardware and directory depth*
-
-## Usage
-
-### Python Version (Recommended)
-
-**Normal Mode:**
-```bash
-./copied.py
-```
-
-Or:
-
-```bash
-python3 copied.py
-```
-
-**Verbose/Debug Mode:**
-```bash
-./copied.py --verbose
-# or
-./copied.py -v
-```
-
-Verbose mode shows detailed matching information:
-- Files grouped by extension
-- Each matching attempt with results
-- Exact substring matches found
-- Summary of matches vs. non-matches
-
-This is helpful for troubleshooting when files aren't matching as expected.
-
-**Help:**
-```bash
-./copied.py --help
-```
-
-### Shell Version
-
-```bash
-./copied.sh
-```
-
-## How It Works
-
-1. **Select Drive**: Choose the main drive where photos are stored
-2. **Select SD Card**: Choose the SD card directory to check
-3. **Enter Prefix**: Specify prefix for renamed files (e.g., "COPIED_")
-4. **Scan**: Script scans both locations and builds file index
-5. **Match**: Finds files with identical basenames and extensions
-6. **Review**: Shows all matches for confirmation
-7. **Rename**: Adds prefix to matched files on SD card
-
-## Example
-
-**Before:**
-```
-SD Card/
-  ├── IMG_1234.jpg
-  ├── IMG_5678.RAF
-  └── IMG_9999.jpg
-
-Drive/
-  └── Photos/
-      ├── IMG_1234.jpg
-      └── IMG_5678.RAF
-```
-
-**After** (with prefix "COPIED_"):
-```
-SD Card/
-  ├── COPIED_IMG_1234.jpg
-  ├── COPIED_IMG_5678.RAF
-  └── IMG_9999.jpg
-```
+Winnow scans an SD card (or any source folder) against a destination drive, finds the photos that have **already been copied over**, and lets you review each match side by side before safely quarantining the redundant copies on the card. Nothing is deleted — duplicates are moved to a quarantine folder and every action is logged so it can be undone.
 
 ## Features
 
-- ✅ **GUI Folder Selection**: User-friendly dialog boxes
-- ✅ **Recursive Search**: Searches all subdirectories
-- ✅ **Extension Matching**: Matches files with same extension
-- ✅ **Cross-Format Detection**: NEW! Detects when same photo exists in different formats (e.g., RAW + JPG)
-- ✅ **Format Blacklist**: NEW! Auto-excludes irrelevant formats (.cop, .cos, .cot, etc.) - easily customizable
-- ✅ **Interactive Format Filter**: Select which format conversions to include (e.g., include .raf→.jpg, skip others)
-- ✅ **Grouped Results**: Separately displays exact matches vs. cross-format matches
-- ✅ **Selective Renaming**: Choose to rename exact matches, cross-format matches, or both
-- ✅ **Progress Indicators**: Real-time processing updates
-- ✅ **Safe Renaming**: Checks for existing files before renaming
-- ✅ **Error Handling**: Graceful handling of permission issues
-- ✅ **Batch Processing**: Handles thousands of files efficiently
-- ✅ **Verbose Mode**: Detailed debugging output with `--verbose` flag
+- **Reliable duplicate detection** — matches by name + size with partial/full BLAKE2b hashing to confirm, plus content-only matching to catch files that were renamed after copying.
+- **EXIF-aware review** — capture time, camera model, lens, and dimensions are shown for each match. EXIF is loaded only for matched files, so scanning stays fast.
+- **Side-by-side previews** — real image previews rendered in the terminal (sixel / iTerm2 / kitty, with automatic fallback), including embedded previews extracted from RAW files.
+- **Safe by design** — duplicates are moved to a `.photo_dupe_quarantine/` folder with a JSONL transaction log, so every quarantine and rename can be undone. Destructive actions require a confirming second press.
+- **Name-substring scan & rename** — find and rewrite a substring across filenames (e.g. strip an import prefix) in bulk.
 
 ## Requirements
 
-### Python Version
-- Python 3.6 or higher (pre-installed on macOS 10.15+)
-- tkinter (included with Python on macOS)
+- Python ≥ 3.11
+- [`uv`](https://docs.astral.sh/uv/) for dependency management
 
-### Shell Version
-- zsh (default shell on macOS)
-- macOS with AppleScript support
+Optional, improves RAW preview quality:
+- `exiftool` — extracts embedded JPEG previews from RAW files
+- `rawpy` + `Pillow` — fallback RAW decode (installed as dependencies)
 
-## Technical Details
+## Usage
 
-### Python Optimization Techniques
+```bash
+# Run the app
+uv run python photo_dupe.py
+```
 
-1. **Multiprocessing**: Uses `ProcessPoolExecutor` to leverage multiple CPU cores
-2. **Chunked Processing**: Divides file lists into optimal chunks for parallel processing
-3. **Dictionary Indexing**: O(1) lookup time vs O(n) for shell arrays
-4. **Path Objects**: Uses `pathlib.Path` for efficient file operations
-5. **Type Hints**: Ensures code correctness and maintainability
+Point it at your **destination drive** (where photos already live) and your **SD card / source folder**. Winnow scans both, presents the matches, and lets you review and quarantine the copies that are safely backed up.
 
-### Algorithm Complexity
+## Development
 
-**Shell Version:**
-- Time Complexity: O(n × m) where n = SD card files, m = drive files
-- Space Complexity: O(n + m)
+```bash
+# Run the full test suite
+uv run python -m pytest tests/
 
-**Python Version:**
-- Time Complexity: O(n + m) with parallel processing
-- Space Complexity: O(n + m)
-- Parallel Speedup: Up to 8x depending on CPU cores
+# A single test file
+uv run python -m pytest tests/test_photo_dupe_safety.py
+```
 
-## Troubleshooting
-
-### Permission Errors
-Ensure you have read/write access to the SD card and sufficient permissions.
-
-### No Matches Found
-- Verify the drive path contains the copied files
-- Check that file extensions match exactly
-- Ensure files have the same base name
-
-### Python Import Errors
-All required modules (os, sys, pathlib, tkinter) are part of Python's standard library on macOS.
-
-## Future Enhancements
-
-Potential improvements:
-- [ ] Add checksum-based duplicate detection (byte-for-byte comparison)
-- [ ] Support for undo/rollback operations
-- [ ] Export match report to CSV
-- [ ] Command-line argument support
-- [ ] Dry-run mode to preview changes
-
-## License
-
-Free to use and modify for personal or commercial purposes.
+The application lives in a single module, `photo_dupe.py`. See `CLAUDE.md` for an architecture overview and `PREVIEW.md` for details on the preview pipeline.

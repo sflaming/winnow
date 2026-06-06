@@ -1,7 +1,7 @@
 [project]
-name = "findcopiedpics"
+name = "winnow"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Textual TUI that finds photos on an SD card already copied to a destination drive, then reviews and quarantines the duplicates."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

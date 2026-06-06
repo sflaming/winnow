@@ -1,9 +1,34 @@
-.python-version
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Virtual environment / tooling
+.venv/
+.python-version
+.pytest_cache/
+.claude/
+
+# Secrets / local config
+*.env
+.env
+
+# Databases / logs
 *.db
 *.sqlite3
 *.log
-*.env   
+
+# macOS
+.DS_Store
+
+# Runtime artifacts
+.photo_dupe_quarantine/
+.photo_dupe_transactions.jsonl
+
+# Legacy predecessors — kept on disk, to be relocated out of the repo later
+/copied.py
+/copied.sh
+/copied copy.sh
+/README_old.md
+/TestFolder/

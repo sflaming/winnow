@@ -1281,7 +1281,7 @@ def resolve_preview_image(path: Path) -> Tuple[Optional[Path], str]:
 # -----------------------------
 
 class PhotoDupeTUI(App):
-    TITLE = "Photo Duplicate Finder (EXIF-aware TUI)"
+    TITLE = "Winnow — Photo Duplicate Finder (EXIF-aware TUI)"
 
     CSS = """
     Screen { layout: vertical; }

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Photo Duplicate Finder — a Textual TUI app that finds photos on an SD card that already exist on a destination drive, then lets the user review matches and quarantine (or legacy-rename) the SD copies. The active codebase is `photo_dupe.py`; the older `copied.py` and `copied.sh` are legacy predecessors.
+Winnow (package name `winnow`) — a Textual TUI app that finds photos on an SD card that already exist on a destination drive, then lets the user review matches and quarantine (or legacy-rename) the SD copies. The active codebase is `photo_dupe.py`. The older `copied.py` and `copied.sh` predecessors are no longer tracked in the repo (kept on disk only, pending relocation).
 
 ## Commands
 
